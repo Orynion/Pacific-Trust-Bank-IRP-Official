@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test src/bank-logic.test.js src/transaction-history.test.js src/ticket-ops.test.js"
+    "test": "node --test src/bank-logic.test.js src/transaction-history.test.js src/ticket-ops.test.js src/security-exploits.test.js"
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",

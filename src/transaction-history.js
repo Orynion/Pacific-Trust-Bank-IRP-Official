@@ -71,3 +71,29 @@ export async function getTransactionHistory(db, userId, requestedPage) {
 
   return transactionHistoryPayload(userId, page, rowsResult.rows, totalCount);
 }
+
+/**
+ * Handler for the Previous/Next pagination buttons on a transaction-history
+ * message. Enforces ownership server-side: only the member for whom the
+ * history was opened may operate these buttons, regardless of who can
+ * otherwise interact with the message.
+ */
+export async function handleHistoryButton(db, interaction, ownerId, requestedPage) {
+  if (interaction.user.id !== ownerId) {
+    await interaction.reply({
+      content: "Only the person who opened this transaction history can use these buttons.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  try {
+    const payload = await getTransactionHistory(db, ownerId, Number(requestedPage));
+    await interaction.update({ content: payload.content, components: payload.components });
+  } catch (error) {
+    console.error("Transaction history pagination failed:", error);
+    await interaction.reply({
+      content: "I could not load that page right now. Please try again shortly.",
+      flags: MessageFlags.Ephemeral,
+    }).catch((replyError) => console.error("Could not send history error reply:", replyError));
+  }
+}

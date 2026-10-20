@@ -1,5 +1,4 @@
 import { MessageFlags, PermissionFlagsBits } from "discord.js";
-import { validateMoneyAmount } from "./bank-ops.js";
 
 export const recurringChargeSchemaStatements = [
   `CREATE TABLE IF NOT EXISTS recurring_charges (
@@ -65,36 +64,8 @@ export async function sendDueChargeReminders(db, client, now = new Date()) {
   return due.rows.length;
 }
 
-export async function handleBillCommand(db, interaction) {
+export async function handleBillCommand(db, interaction, kind) {
   const action = interaction.options.getSubcommand();
-  if (action === "set") {
-    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
-      await interaction.reply({ content: "Only server administrators can set recurring charges.", ...ephemeral });
-      return;
-    }
-    const target = interaction.options.getUser("user", true);
-    const kind = interaction.options.getString("type", true);
-    const name = interaction.options.getString("name", true).trim();
-    const amount = interaction.options.getInteger("amount", true);
-    const interval = interaction.options.getString("interval", true);
-    const validation = validateMoneyAmount(amount);
-    if (!validation.ok || !name || name.length > 60) {
-      await interaction.reply({ content: validation.message ?? "Name must be 1 to 60 characters.", ...ephemeral });
-      return;
-    }
-    const account = await db.execute({ sql: "SELECT 1 FROM accounts WHERE discord_id = ?", args: [target.id] });
-    if (!account.rows.length) {
-      await interaction.reply({ content: `${target.username} does not have a registered PTB account.`, ...ephemeral });
-      return;
-    }
-    const due = addInterval(new Date(), interval);
-    await db.execute({
-      sql: "INSERT INTO recurring_charges (discord_id, kind, name, amount, interval, next_due_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      args: [target.id, kind, name, amount, interval, due, interaction.user.id],
-    });
-    await interaction.reply({ content: `Recurring ${kind} **${name}** for ${target.username} is set to ${amount.toLocaleString()} ${interval}, starting <t:${Math.floor(new Date(due).getTime() / 1000)}:R>.`, ...ephemeral });
-    return;
-  }
   if (action === "settle") {
     const requestedUser = interaction.options.getUser("user");
     const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
@@ -112,13 +83,13 @@ export async function handleBillCommand(db, interaction) {
         return;
       }
       const chargeResult = await tx.execute({
-        sql: "SELECT * FROM recurring_charges WHERE discord_id = ? AND active = 1 AND next_due_at <= ? ORDER BY id LIMIT 1000",
-        args: [accountId, settledAt],
+        sql: "SELECT * FROM recurring_charges WHERE discord_id = ? AND kind = ? AND active = 1 AND next_due_at <= ? ORDER BY id LIMIT 1000",
+        args: [accountId, kind, settledAt],
       });
       const charges = chargeResult.rows;
       if (!charges.length) {
         await tx.rollback();
-        await interaction.reply({ content: "There are no active recurring bills or taxes to settle.", ...ephemeral });
+        await interaction.reply({ content: `There are no ${kind === "tax" ? "taxes" : "bills"} currently due to settle.`, ...ephemeral });
         return;
       }
       const total = charges.reduce((sum, charge) => sum + Number(charge.amount), 0);
@@ -126,7 +97,7 @@ export async function handleBillCommand(db, interaction) {
       const balance = Number(account.rows[0]?.balance ?? 0);
       if (!Number.isSafeInteger(total) || Number(account.rows[0]?.frozen) === 1 || balance < total) {
         await tx.rollback();
-        await interaction.reply({ content: `Insufficient funds. Nothing was deducted. Available balance: ${balance.toLocaleString()}; total for all active bills and taxes: ${total.toLocaleString()}. Your recurring schedules were not changed.`, ...ephemeral });
+        await interaction.reply({ content: `Insufficient funds. Nothing was deducted. Available balance: ${balance.toLocaleString()}; total due for ${kind === "tax" ? "taxes" : "bills"}: ${total.toLocaleString()}. Your recurring schedules were not changed.`, ...ephemeral });
         return;
       }
       const debit = await tx.execute({
@@ -160,7 +131,7 @@ export async function handleBillCommand(db, interaction) {
       });
       await tx.commit();
       const who = accountId === interaction.user.id ? "your" : `<@${accountId}>'s`;
-      await interaction.reply({ content: `Settled all ${charges.length} active bill(s) and tax(es) for ${who}, totaling ${total.toLocaleString()}. Their next scheduled deductions are one interval from now.`, allowedMentions: { users: accountId === interaction.user.id ? [] : [accountId] }, ...ephemeral });
+      await interaction.reply({ content: `Settled ${charges.length} ${kind === "tax" ? "tax(es)" : "bill(s)"} for ${who}, totaling ${total.toLocaleString()}. Their next scheduled deductions are one interval from now.`, allowedMentions: { users: accountId === interaction.user.id ? [] : [accountId] }, ...ephemeral });
       for (const charge of charges) {
         await sendUserNotice(interaction.client, accountId,
           `PTB transaction: settled ${charge.kind} **${charge.name}** for ${Number(charge.amount).toLocaleString()}. This charge is recorded in your transaction history.`);
@@ -174,11 +145,11 @@ export async function handleBillCommand(db, interaction) {
     return;
   }
   const result = await db.execute({
-    sql: "SELECT id, kind, name, amount, interval, next_due_at FROM recurring_charges WHERE discord_id = ? AND active = 1 ORDER BY next_due_at",
-    args: [interaction.user.id],
+    sql: "SELECT id, kind, name, amount, interval, next_due_at FROM recurring_charges WHERE discord_id = ? AND kind = ? AND active = 1 ORDER BY next_due_at",
+    args: [interaction.user.id, kind],
   });
   const lines = result.rows.map((row) => `#${row.id} **${row.kind} · ${row.name}** — ${Number(row.amount).toLocaleString()} / ${row.interval}, next <t:${Math.floor(new Date(row.next_due_at).getTime() / 1000)}:R>`);
-  await interaction.reply({ content: lines.length ? `**Your recurring charges**\n${lines.join("\n")}` : "You have no active recurring charges.", ...ephemeral });
+  await interaction.reply({ content: lines.length ? `**Your recurring ${kind === "tax" ? "taxes" : "bills"}**\n${lines.join("\n")}` : `You have no active recurring ${kind === "tax" ? "taxes" : "bills"}.`, ...ephemeral });
 }
 
 // Run at startup and every minute. The charge row's due timestamp is a claim

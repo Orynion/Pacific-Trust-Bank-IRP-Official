@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { MessageFlags, PermissionFlagsBits } from "discord.js";
 import { attachTicketChannel, createPendingTicket, handleTicketDecision, rejectPendingTicketByChannel, ticketSchemaStatements } from "./ticket-ops.js";
-import { handleBalance, schemaStatements } from "./bank-ops.js";
+import { handleBalance, handleTransfer, schemaStatements } from "./bank-ops.js";
 
 // ---------------------------------------------------------------------------
 // Isolation: every test uses its own throwaway local SQLite file database in
@@ -78,12 +78,13 @@ async function getTicket(db, ticketId) {
 
 let nextFakeTicketInteractionId = 8_605_000_000_000_000_000n;
 
-function ticketInteraction({ userId, permissions = [ADMIN_FLAG], id = (nextFakeTicketInteractionId++).toString() } = {}) {
+function ticketInteraction({ userId, permissions = [ADMIN_FLAG], id = (nextFakeTicketInteractionId++).toString(), channelId = null } = {}) {
   const state = { replies: [], deferred: false, replied: false };
   const interaction = {
     id,
     user: { id: userId, username: `user_${userId}`, bot: false, tag: `user_${userId}#0001` },
     memberPermissions: permissions === null ? null : { has: (flag) => permissions.includes(flag) },
+    channelId,
     async reply(payload) {
       if (state.replied) throw new Error("interaction.reply called twice");
       state.replied = true;
@@ -102,8 +103,8 @@ function ticketInteraction({ userId, permissions = [ADMIN_FLAG], id = (nextFakeT
  * handler. All clicks target the same tickets table, so sequencing matches
  * production button order.
  */
-function decide(db, { adminId, action, ticketId, permissions, id, dbOverride }) {
-  const interaction = ticketInteraction({ userId: adminId, permissions, id });
+function decide(db, { adminId, action, ticketId, permissions, id, dbOverride, channelId }) {
+  const interaction = ticketInteraction({ userId: adminId, permissions, id, channelId });
   const run = handleTicketDecision(dbOverride ?? db, interaction, action, String(ticketId));
   return { interaction, run };
 }
@@ -522,59 +523,70 @@ test("tickets 11: approval of a payout is blocked while funds are insufficient",
   }
 });
 
-test("tickets 12: racing payouts for one account cannot overspend", async () => {
+test("tickets 12: payouts and transfers for one account cannot jointly overspend it", async () => {
   const { db, dir } = openTestDb();
   try {
-    await db.batch([...schemaStatements, ...ticketSchemaStatements], "write");
+    await db.batch(schemaStatements, "write");
+    await db.batch(ticketSchemaStatements, "write");
     await seedAccount(db, "300000000000000020", { balance: 100 });
+    const receiptId = "888000000000000044";
+    await seedAccount(db, receiptId);
 
-    const ticketA = await createPendingTicket(db, { kind: "withdraw", requesterId: "300000000000000020", amount: 60 });
-    const ticketB = await createPendingTicket(db, { kind: "withdraw", requesterId: "300000000000000020", amount: 70 });
-    await decide(db, { adminId: ADMIN_A, action: "approve", ticketId: ticketA }).run;
-    await decide(db, { adminId: ADMIN_B, action: "approve", ticketId: ticketB }).run;
+    const makeTransfer = (id, amount) => ({
+      id,
+      user: { id: "300000000000000020", username: "user_300000000000000020", bot: false, tag: "user_300000000000000020#0001" },
+      options: {
+        getUser: () => ({ id: receiptId, username: `user_${receiptId}`, bot: false }),
+        getInteger: () => amount,
+        getBoolean: () => true,
+      },
+      inGuild: () => true,
+      guild: { channels: { fetch: async () => ({ find: () => undefined }) }, roles: { everyone: { id: "everyone-role" } } },
+      isButton: () => false,
+      state: { replies: [] },
+      async reply(payload) { this.state.replies.push(payload); return payload; },
+    });
 
-    // Both payouts race for the same 100 balance; 60 + 70 > 100.
-    const clicks = [
-      decide(db, { adminId: ADMIN_B, action: "complete", ticketId: ticketA, id: "863000000000000021" }),
-      decide(db, { adminId: ADMIN_C, action: "complete", ticketId: ticketB, id: "863000000000000022" }),
-    ];
-    const outcomes = await Promise.allSettled(clicks.map((click) => click.run));
+    // Approve a 60 payout while the balance (100) is still sufficient...
+    const payoutTicket = await createPendingTicket(db, { kind: "withdraw", requesterId: "300000000000000020", amount: 60 });
+    await decide(db, { adminId: ADMIN_A, action: "approve", ticketId: payoutTicket }).run;
+
+    // ...then a 70 transfer legally drains the balance to 30.
+    await handleTransfer(db, makeTransfer("863000000000000020", 70));
+    assert.equal(await getBalance(db, "300000000000000020"), 30);
+
+    // The approved payout must now refuse and stay retryable: transfers and
+    // ticket payouts share one balance that can never jointly overdraft.
+    const payout = decide(db, { adminId: ADMIN_B, action: "complete", ticketId: payoutTicket, id: "863000000000000021" });
+    await payout.run;
+    assert.match(
+      payout.interaction.state.replies[0].content,
+      /Cannot pay out .*current balance is 30/,
+    );
+    assert.equal((await getTicket(db, payoutTicket)).status, "approved", "the payout stays approved for a later retry");
+
+    const midLedger = await getLedger(db);
+    const transferredSoFar = midLedger
+      .filter((row) => row.type === "transfer" && row.from_id === "300000000000000020")
+      .reduce((sum, row) => sum + row.amount, 0);
+    assert.equal(transferredSoFar, 70);
+    assert.deepEqual(midLedger.filter((row) => row.type === "withdraw"), [], "a refused payout writes no ledger row");
+
+    // Once funds exist (administrator tops the account up by 40: 30 -> 70),
+    // the same approved ticket completes EXACTLY once.
+    await db.execute({
+      sql: "UPDATE accounts SET balance = balance + 40 WHERE discord_id = ?",
+      args: ["300000000000000020"],
+    });
+    const retry = decide(db, { adminId: ADMIN_C, action: "complete", ticketId: payoutTicket, id: "863000000000000022" });
+    await retry.run;
+    assert.match(retry.interaction.state.replies[0].content, /completed: paid out 60/);
+    assert.equal(await getBalance(db, "300000000000000020"), 10, "the retry debits the topped-up balance exactly once");
 
     const ledger = await getLedger(db);
-    const payouts = ledger.filter((row) => row.type === "withdraw");
-    const paid = payouts.reduce((sum, row) => sum + row.amount, 0);
-
-    assert.ok(paid <= 100, `committed payouts (${paid}) must never exceed the balance`);
-    const finalBalance = await getBalance(db, "300000000000000020");
-    assert.ok(finalBalance >= 0);
-    assert.equal(finalBalance, 100 - paid, "balance must exactly equal the committed payout total");
-
-    // Resolve any pending approved tickets deterministically (the payout guard
-    // denies these if the racing payout already took the funds).
-    for (const ticketId of [ticketA, ticketB]) {
-      const row = await getTicket(db, ticketId);
-      if (row.status === "approved") {
-        await decide(db, { adminId: ADMIN_A, action: "complete", ticketId }).run;
-      }
-    }
-    const finalLedger = await getLedger(db);
-    const finalPayouts = finalLedger.filter((row) => row.type === "withdraw");
-    const finalPaid = finalPayouts.reduce((sum, row) => sum + row.amount, 0);
-    const ticketsNow = [await getTicket(db, ticketA), await getTicket(db, ticketB)];
-    const completedCount = ticketsNow.filter((row) => row.status === "completed").length;
-    assert.equal(completedCount, finalPayouts.length, "each completed ticket owns exactly one ledger payout");
-    assert.ok(finalPaid <= 100, `final payouts (${finalPaid}) must never exceed the balance`);
-    assert.equal(await getBalance(db, "300000000000000020"), 100 - finalPaid, "final balance minus payouts must be intact");
-
-    for (const [index, outcome] of outcomes.entries()) {
-      if (outcome.status === "fulfilled") {
-        const content = clicks[index].interaction.state.replies?.[0]?.content ?? "";
-        assert.ok(
-          /completed: paid out|current balance is .*remains approved|changed state|balance changed concurrently/.test(content),
-          `unexpected reply content: ${content}`,
-        );
-      }
-    }
+    const paidRows = ledger.filter((row) => row.type === "withdraw");
+    assert.equal(paidRows.length, 1, "exactly one completed payout, despite the first refused attempt");
+    assert.equal(await getBalance(db, receiptId), 70, "the recipient received exactly the transfer");
   } finally {
     try { await db.close(); } catch { }
     await removeDirBestEffort(dir);
@@ -692,7 +704,7 @@ test("tickets 16: closing a pending ticket channel rejects the ticket so payouts
     assert.equal(row.status, "rejected");
     assert.match(row.note, /Ticket channel closed/);
 
-    const payoutAttempt = decide(db, { adminId: ADMIN_A, action: "complete", ticketId });
+    const payoutAttempt = decide(db, { adminId: ADMIN_A, action: "complete", ticketId, channelId: "channel-42" });
     await payoutAttempt.run;
     assert.match(payoutAttempt.interaction.state.replies[0].content, /was rejected.*cannot be processed\./);
     assert.equal(await getBalance(db, "300000000000000024"), 700);
@@ -701,8 +713,8 @@ test("tickets 16: closing a pending ticket channel rejects the ticket so payouts
     // Completed tickets must NOT be affected by a late channel close.
     const done = await createPendingTicket(db, { kind: "deposit", requesterId: "300000000000000024", amount: 15 });
     await attachTicketChannel(db, done, "channel-43");
-    await decide(db, { adminId: ADMIN_A, action: "approve", ticketId: done }).run;
-    await decide(db, { adminId: ADMIN_A, action: "complete", ticketId: done }).run;
+    await decide(db, { adminId: ADMIN_A, action: "approve", ticketId: done, channelId: "channel-43" }).run;
+    await decide(db, { adminId: ADMIN_A, action: "complete", ticketId: done, channelId: "channel-43" }).run;
     await rejectPendingTicketByChannel(db, "channel-43", "Ticket channel closed");
     assert.equal((await getTicket(db, done)).status, "completed", "completed state survives channel closure");
     assert.equal(await getBalance(db, "300000000000000024"), 715);

@@ -20,6 +20,20 @@ export const ticketSchemaStatements = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_tickets_channel
     ON tickets (channel_id)`,
+  // Repair migration: if legacy data contains several simultaneous pending
+  // requests of the same user and kind (possible before the guard below
+  // existed), keep the oldest pending row and auto-close the duplicates so
+  // the unique index creation can never fail at startup.
+  `UPDATE tickets SET status = 'rejected',
+      note = CASE WHEN note IS NULL OR note = '' THEN 'Duplicate open request auto-closed (one open request per user and kind)'
+             ELSE note || ' | Duplicate open request auto-closed (one open request per user and kind)' END
+    WHERE status = 'pending'
+      AND id <> (SELECT MIN(id) FROM tickets AS t2
+        WHERE t2.requester_id = tickets.requester_id AND t2.kind = tickets.kind AND t2.status = 'pending')`,
+  // Enforces exactly one open (pending) request per user and kind, even for
+  // two racing /deposit or /withdraw invocations.
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_open_per_user
+    ON tickets (requester_id, kind) WHERE status = 'pending'`,
 ];
 
 export function ticketCode(ticket) {
@@ -76,6 +90,20 @@ export async function rejectPendingTicketByChannel(db, channelId, note) {
       WHERE channel_id = ? AND status = 'pending'`,
     args: [note, note, channelId],
   });
+}
+
+// Single source of truth for ticket channel topics:
+//   ptb-ticket:<kind>:<requesterId>:<amount>:<ticketId>
+// bank-ops.js builds topics with this pattern and handleTicketClose below
+// validates against it, so the two sides cannot drift.
+export const TICKET_TOPIC_REGEX = /^ptb-ticket:(deposit|withdraw):(\d+):\d+(?::\d+)?$/;
+
+export function ticketTopic(kind, requesterId, amount, ticketId) {
+  return `ptb-ticket:${kind}:${requesterId}:${amount}:${ticketId}`;
+}
+
+export function ticketTopicPrefix(kind, requesterId) {
+  return `ptb-ticket:${kind}:${requesterId}:`;
 }
 
 export async function getTicket(db, transaction, ticketId) {
@@ -148,6 +176,19 @@ export async function handleTicketDecision(db, interaction, action, ticketIdRaw)
       return;
     }
     const code = ticketCode(ticket);
+
+    // Channel binding: a decision button is only valid inside the private
+    // ticket channel that owns this ticket. A button interaction replayed in
+    // any other channel (or a moved/copied message) must never be able to flip
+    // ticket state — this keeps decisions auditable in the right place.
+    if (ticket.channel_id && String(interaction.channelId ?? "") !== String(ticket.channel_id)) {
+      await transaction.rollback();
+      await interaction.reply({
+        content: `${code} can only be processed inside its private ticket channel.`,
+        ...ephemeralReply,
+      });
+      return;
+    }
 
     if (action === "approve") {
       if (ticket.status === "pending") {
@@ -407,5 +448,47 @@ export async function handleTicketDecision(db, interaction, action, ticketIdRaw)
     throw error;
   } finally {
     transaction.close();
+  }
+}
+
+/**
+ * Closes a deposit/withdrawal ticket channel from its Close ticket button.
+ * Verifies the interaction targets the real PTB ticket channel (channel ID +
+ * channel topic) so the button cannot be abused against unrelated channels,
+ * then requires the opener or a server administrator. Pending tickets are
+ * marked rejected when their channel closes; approved/completed keep state.
+ */
+export async function handleTicketClose(db, interaction, channelId, ownerId) {
+  const channel = interaction.channel;
+  if (
+    !channel || channel.id !== channelId ||
+    !channel.topic?.match(TICKET_TOPIC_REGEX) ||
+    channel.topic.split(":")[2] !== ownerId
+  ) {
+    await interaction.reply({ content: "This ticket could not be verified.", ...ephemeralReply });
+    return;
+  }
+
+  if (
+    interaction.user.id !== ownerId &&
+    !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+  ) {
+    await interaction.reply({ content: "Only the ticket opener or a server administrator can close this ticket.", ...ephemeralReply });
+    return;
+  }
+
+  await interaction.deferReply(ephemeralReply);
+  try {
+    // A pending ticket whose channel is closed can no longer be reviewed, so
+    // record it as rejected (approved/completed tickets keep their state).
+    // A database hiccup here must not block the Discord cleanup.
+    await rejectPendingTicketByChannel(db, channelId, "Ticket channel closed").catch((error) => {
+      console.error("Could not reject pending PTB ticket on close:", error);
+    });
+    await channel.delete(`PTB ticket closed by ${interaction.user.tag}`);
+    await interaction.editReply("Ticket closed.");
+  } catch (error) {
+    console.error("Could not close PTB ticket:", error);
+    await interaction.editReply("I could not close this ticket. Please ask a server administrator to check my Manage Channels permission.");
   }
 }

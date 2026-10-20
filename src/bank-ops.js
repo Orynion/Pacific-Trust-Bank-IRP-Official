@@ -3,6 +3,8 @@ import {
   attachTicketChannel,
   createPendingTicket,
   rejectTicketWithNote,
+  ticketTopic,
+  ticketTopicPrefix,
 } from "./ticket-ops.js";
 
 export const MAX_BALANCE = 2_147_483_647;
@@ -95,7 +97,19 @@ export async function handleMoneyRequest(db, interaction, type) {
     return;
   }
 
-  const ticketPrefix = `ptb-ticket:${type}:${interaction.user.id}:`;
+  // Server-side duplicate-request guard (backed by a unique partial index on
+  // open tickets), so two racing /deposit or /withdraw invocations cannot both
+  // open tickets for the same account.
+  const existingRequestResult = await db.execute({
+    sql: "SELECT 1 FROM tickets WHERE requester_id = ? AND kind = ? AND status = 'pending' LIMIT 1",
+    args: [interaction.user.id, type],
+  });
+  if (existingRequestResult.rows.length > 0) {
+    await interaction.editReply(`You already have an open ${type} ticket. Close it before opening another.`);
+    return;
+  }
+
+  const ticketPrefix = ticketTopicPrefix(type, interaction.user.id);
   const channels = await interaction.guild.channels.fetch();
   const existingTicket = channels.find((channel) =>
     channel?.type === ChannelType.GuildText && channel.topic?.startsWith(ticketPrefix));
@@ -110,6 +124,13 @@ export async function handleMoneyRequest(db, interaction, type) {
   try {
     ticketId = await createPendingTicket(db, { kind: type, requesterId: interaction.user.id, amount });
   } catch (error) {
+    // The unique partial index makes the duplicate guard atomic: another
+    // racing request may have claimed the only pending slot between the
+    // pre-check and this insert.
+    if (/idx_tickets_open_per_user|UNIQUE constraint failed/i.test(String(error?.message ?? ""))) {
+      await interaction.editReply(`You already have an open ${type} ticket. Close it before opening another.`);
+      return;
+    }
     console.error("Could not create the PTB ticket record:", error);
     await interaction.editReply("I could not open the ticket right now because the ledger database rejected it. Please try again shortly.");
     return;
@@ -127,7 +148,7 @@ export async function handleMoneyRequest(db, interaction, type) {
     channel = await interaction.guild.channels.create({
       name: `${type}-${safeUsername}`,
       type: ChannelType.GuildText,
-      topic: `${ticketPrefix}${amount}:${ticketId}`,
+      topic: ticketTopic(type, interaction.user.id, amount, ticketId),
       permissionOverwrites: [
         {
           id: interaction.guild.roles.everyone.id,

@@ -15,8 +15,9 @@ import {
   Routes,
   SlashCommandBuilder,
 } from "discord.js";
-import { getTransactionHistory } from "./transaction-history.js";
+import { getTransactionHistory, handleHistoryButton } from "./transaction-history.js";
 import { handleBillCommand, processDueCharges, recurringChargeSchemaStatements, sendDueChargeReminders } from "./recurring-charges.js";
+import { isAllowedCallbackHost, buildTokenRequestBody } from "./oauth-security.js";
 import {
   ephemeralReply,
   handleAddBalance,
@@ -26,8 +27,8 @@ import {
   schemaStatements,
 } from "./bank-ops.js";
 import {
+  handleTicketClose,
   handleTicketDecision,
-  rejectPendingTicketByChannel,
   ticketSchemaStatements,
 } from "./ticket-ops.js";
 
@@ -54,7 +55,7 @@ let ready = false;
 const healthServer = createServer((request, response) => {
   const requestUrl = new URL(request.url ?? "/", "http://localhost");
   if (request.method === "GET" && requestUrl.pathname === "/oauth/roblox/callback") {
-    void handleRobloxOAuthCallback(requestUrl, response);
+    void handleRobloxOAuthCallback(request, response);
     return;
   }
 
@@ -155,20 +156,18 @@ const transferCommand = new SlashCommandBuilder()
     .setDescription("Confirm that you want to transfer this amount.")
     .setRequired(true));
 
-const billCommand = new SlashCommandBuilder()
-  .setName("bill")
-  .setDescription("Manage recurring bills and taxes on PTB ledger accounts.")
-  .addSubcommand((subcommand) => subcommand.setName("list").setDescription("List your active recurring bills and taxes."))
-  .addSubcommand((subcommand) => subcommand.setName("settle").setDescription("Settle all active recurring bills and taxes now.")
-    .addUserOption((option) => option.setName("user").setDescription("Account to settle (administrator only).")))
-  .addSubcommand((subcommand) => subcommand.setName("set").setDescription("Set a recurring charge for an account (administrator only).")
-    .addUserOption((option) => option.setName("user").setDescription("Account to charge.").setRequired(true))
-    .addStringOption((option) => option.setName("type").setDescription("Bill or tax.").setRequired(true)
-      .addChoices({ name: "Bill", value: "bill" }, { name: "Tax", value: "tax" }))
-    .addStringOption((option) => option.setName("name").setDescription("Charge label (up to 60 characters).").setMaxLength(60).setRequired(true))
-    .addIntegerOption((option) => option.setName("amount").setDescription("Amount in ledger units.").setMinValue(1).setMaxValue(2_147_483_647).setRequired(true))
-    .addStringOption((option) => option.setName("interval").setDescription("How often to deduct.").setRequired(true)
-      .addChoices({ name: "Daily", value: "daily" }, { name: "Weekly", value: "weekly" }, { name: "Monthly", value: "monthly" })));
+function createRecurringCommand(kind) {
+  const plural = kind === "tax" ? "taxes" : "bills";
+  return new SlashCommandBuilder()
+    .setName(kind)
+    .setDescription(`Manage recurring ${plural} on PTB ledger accounts.`)
+    .addSubcommand((subcommand) => subcommand.setName("list").setDescription(`List your active recurring ${plural}.`))
+    .addSubcommand((subcommand) => subcommand.setName("settle").setDescription(`Settle all currently due ${plural}.`)
+      .addUserOption((option) => option.setName("user").setDescription("Account to settle (administrator only).")));
+}
+
+const billCommand = createRecurringCommand("bill");
+const taxCommand = createRecurringCommand("tax");
 
 function createHelpEmbed(isAdministrator) {
   const embed = new EmbedBuilder()
@@ -186,7 +185,7 @@ function createHelpEmbed(isAdministrator) {
           "`/register` — Link your Roblox account to PTB.\nExample: `/register`",
           "`/verify` — Start Roblox verification for your PTB account.\nExample: `/verify`",
           "`/balance` — Privately check your own PTB balance.\nExample: `/balance`",
-          "`/bill list` — View active recurring bills and taxes; `/bill settle` pays all active charges now.",
+          "`/bill list` and `/tax list` — View recurring bills and taxes separately. Use `/bill settle` or `/tax settle` to settle due charges of that type.",
         ].join("\n\n"),
       },
       {
@@ -203,7 +202,7 @@ function createHelpEmbed(isAdministrator) {
   if (isAdministrator) {
     embed.addFields({
       name: "Administration",
-      value: "`/add-balance user amount` — Add funds to a registered user's ledger account.\nExample: `/add-balance user:@Alex amount:500`\n`/bill set user type name amount interval` — Create a daily, weekly, or monthly recurring bill or tax.",
+      value: "`/add-balance user amount` — Add funds to a registered user's ledger account.\nExample: `/add-balance user:@Alex amount:500`",
     });
   }
 
@@ -259,41 +258,6 @@ async function handleVerify(interaction) {
   });
 }
 
-async function handleTicketClose(interaction, channelId, ownerId) {
-  const channel = interaction.channel;
-  if (
-    !channel || channel.id !== channelId ||
-    !channel.topic?.match(/^ptb-ticket:(deposit|withdraw):(\d+):\d+(?::\d+)?$/) ||
-    channel.topic.split(":")[2] !== ownerId
-  ) {
-    await interaction.reply({ content: "This ticket could not be verified.", ...ephemeralReply });
-    return;
-  }
-
-  if (
-    interaction.user.id !== ownerId &&
-    !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
-  ) {
-    await interaction.reply({ content: "Only the ticket opener or a server administrator can close this ticket.", ...ephemeralReply });
-    return;
-  }
-
-  await interaction.deferReply(ephemeralReply);
-  try {
-    // A pending ticket whose channel is closed can no longer be reviewed, so
-    // record it as rejected (approved/completed tickets keep their state).
-    // A database hiccup here must not block the Discord cleanup.
-    await rejectPendingTicketByChannel(db, channelId, "Ticket channel closed").catch((error) => {
-      console.error("Could not reject pending PTB ticket on close:", error);
-    });
-    await channel.delete(`PTB ticket closed by ${interaction.user.tag}`);
-    await interaction.editReply("Ticket closed.");
-  } catch (error) {
-    console.error("Could not close PTB ticket:", error);
-    await interaction.editReply("I could not close this ticket. Please ask a server administrator to check my Manage Channels permission.");
-  }
-}
-
 const oauthConfigured = () => Boolean(
   process.env.ROBLOX_CLIENT_ID &&
   process.env.ROBLOX_CLIENT_SECRET &&
@@ -323,6 +287,10 @@ async function startOAuthFlow(interaction, isChange = false) {
     {
       sql: "DELETE FROM oauth_sessions WHERE expires_at <= ? OR discord_id = ?",
       args: [new Date().toISOString(), discordId],
+    },
+    {
+      sql: "DELETE FROM pending_links WHERE expires_at <= ?",
+      args: [new Date().toISOString()],
     },
     {
       sql: `INSERT INTO oauth_sessions (state, discord_id, code_verifier, expires_at)
@@ -414,10 +382,21 @@ async function requestOAuthJson(url, options) {
   return response.json();
 }
 
-async function handleRobloxOAuthCallback(requestUrl, response) {
+async function handleRobloxOAuthCallback(request, response) {
+  const requestUrl = new URL(request.url ?? "/", "http://localhost");
   try {
     if (!oauthConfigured()) {
       sendOAuthResult(response, 503, "Roblox account linking is not configured on PTB yet. Return to Discord and contact a PTB administrator.");
+      return;
+    }
+
+    // Host binding: this endpoint is registered for exactly one public
+    // address (the redirect URI). Requests arriving with an attacker-chosen
+    // Host header (rogue domains parked at this address, DNS rebinding, port
+    // confusion) are refused before any OAuth state is consumed.
+    const hostHeader = request.headers.host ?? "";
+    if (!isAllowedCallbackHost(`http://${hostHeader}`, process.env.ROBLOX_REDIRECT_URI)) {
+      sendOAuthResult(response, 400, "This PTB link page must be opened through its registered address. Return to Discord and run /register again.");
       return;
     }
 
@@ -444,13 +423,9 @@ async function handleRobloxOAuthCallback(requestUrl, response) {
       return;
     }
 
-    const tokenBody = new URLSearchParams({
-      client_id: process.env.ROBLOX_CLIENT_ID,
-      client_secret: process.env.ROBLOX_CLIENT_SECRET,
-      grant_type: "authorization_code",
-      code,
-      code_verifier: session.code_verifier,
-    });
+    // redirect_uri is required here per RFC 6749 §4.1.3 because the
+    // authorization request included it; it must match the registered value.
+    const tokenBody = buildTokenRequestBody(code, session.code_verifier, process.env.ROBLOX_REDIRECT_URI);
     const tokens = await requestOAuthJson("https://apis.roblox.com/oauth/v1/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -609,7 +584,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const ticketCloseMatch = interaction.customId.match(/^ticket-close:(\d+):(\d+)$/);
     if (ticketCloseMatch) {
-      await handleTicketClose(interaction, ticketCloseMatch[1], ticketCloseMatch[2]).catch(async (error) => {
+      await handleTicketClose(db, interaction, ticketCloseMatch[1], ticketCloseMatch[2]).catch(async (error) => {
         console.error("PTB ticket close button failed:", error);
         const reply = { content: "I could not close this ticket right now.", ...ephemeralReply };
         if (interaction.replied || interaction.deferred) {
@@ -624,23 +599,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const historyMatch = interaction.customId.match(/^history:(\d+):(\d+)$/);
     if (historyMatch) {
       const [, ownerId, requestedPage] = historyMatch;
-      if (interaction.user.id !== ownerId) {
-        await interaction.reply({
-          content: "Only the person who opened this transaction history can use these buttons.",
-          ...ephemeralReply,
-        });
-        return;
-      }
-      try {
-        const payload = await getTransactionHistory(db, ownerId, Number(requestedPage));
-        await interaction.update({ content: payload.content, components: payload.components });
-      } catch (error) {
-        console.error("Transaction history pagination failed:", error);
-        await interaction.reply({
-          content: "I could not load that page right now. Please try again shortly.",
-          ...ephemeralReply,
-        }).catch((replyError) => console.error("Could not send history error reply:", replyError));
-      }
+      await handleHistoryButton(db, interaction, ownerId, requestedPage);
       return;
     }
 
@@ -724,8 +683,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleAddBalance(db, interaction);
     } else if (interaction.commandName === "transfer") {
       await handleTransfer(db, interaction);
-    } else if (interaction.commandName === "bill") {
-      await handleBillCommand(db, interaction);
+    } else if (interaction.commandName === "bill" || interaction.commandName === "tax") {
+      await handleBillCommand(db, interaction, interaction.commandName);
     }
   } catch (error) {
     console.error(`Command /${interaction.commandName} failed:`, error);
@@ -764,6 +723,7 @@ try {
         addBalanceCommand.toJSON(),
         transferCommand.toJSON(),
         billCommand.toJSON(),
+        taxCommand.toJSON(),
       ],
     },
   );
