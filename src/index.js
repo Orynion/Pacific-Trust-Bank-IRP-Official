@@ -16,7 +16,7 @@ import {
   SlashCommandBuilder,
 } from "discord.js";
 import { getTransactionHistory } from "./transaction-history.js";
-import { handleBillCommand, processDueCharges, recurringChargeSchemaStatements } from "./recurring-charges.js";
+import { handleBillCommand, processDueCharges, recurringChargeSchemaStatements, sendDueChargeReminders } from "./recurring-charges.js";
 import {
   ephemeralReply,
   handleAddBalance,
@@ -770,9 +770,14 @@ try {
 
   await client.login(process.env.DISCORD_TOKEN);
   ready = true;
-  const runRecurringCharges = () => processDueCharges(db).catch((error) => {
-    console.error("Recurring bill/tax processing failed:", error);
-  });
+  const runRecurringCharges = async () => {
+    try {
+      await sendDueChargeReminders(db, client);
+      await processDueCharges(db, new Date(), client);
+    } catch (error) {
+      console.error("Recurring bill/tax processing failed:", error);
+    }
+  };
   void runRecurringCharges();
   setInterval(runRecurringCharges, 60_000).unref();
 } catch (error) {

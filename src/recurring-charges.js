@@ -15,6 +15,12 @@ export const recurringChargeSchemaStatements = [
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
   "CREATE INDEX IF NOT EXISTS idx_recurring_charges_due ON recurring_charges(active, next_due_at)",
+  `CREATE TABLE IF NOT EXISTS charge_reminders (
+    charge_id INTEGER NOT NULL REFERENCES recurring_charges(id),
+    due_at TEXT NOT NULL,
+    sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (charge_id, due_at)
+  )`,
 ];
 
 const ephemeral = { flags: MessageFlags.Ephemeral };
@@ -25,6 +31,39 @@ const addInterval = (date, interval) => {
   else next.setUTCMonth(next.getUTCMonth() + 1);
   return next.toISOString();
 };
+
+async function sendUserNotice(client, userId, message) {
+  if (!client) return;
+  try {
+    const user = await client.users.fetch(userId);
+    await user.send(message);
+  } catch (error) {
+    console.warn(`Could not send PTB bill notification to ${userId}:`, error?.message ?? error);
+  }
+}
+
+export async function sendDueChargeReminders(db, client, now = new Date()) {
+  const cutoff = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+  const due = await db.execute({
+    sql: `SELECT c.id, c.discord_id, c.kind, c.name, c.amount, c.next_due_at
+      FROM recurring_charges c LEFT JOIN charge_reminders r
+        ON r.charge_id = c.id AND r.due_at = c.next_due_at
+      WHERE c.active = 1 AND c.next_due_at <= ? AND r.charge_id IS NULL
+      ORDER BY c.next_due_at LIMIT 100`,
+    args: [cutoff],
+  });
+  for (const charge of due.rows) {
+    const claimed = await db.execute({
+      sql: "INSERT OR IGNORE INTO charge_reminders (charge_id, due_at) VALUES (?, ?)",
+      args: [charge.id, charge.next_due_at],
+    });
+    if (claimed.rowsAffected !== 1) continue;
+    const timestamp = Math.floor(new Date(charge.next_due_at).getTime() / 1000);
+    await sendUserNotice(client, charge.discord_id,
+      `PTB reminder: your ${charge.kind} **${charge.name}** for ${Number(charge.amount).toLocaleString()} is due <t:${timestamp}:R>. It will be deducted automatically from your PTB ledger balance.`);
+  }
+  return due.rows.length;
+}
 
 export async function handleBillCommand(db, interaction) {
   const action = interaction.options.getSubcommand();
@@ -122,6 +161,10 @@ export async function handleBillCommand(db, interaction) {
       await tx.commit();
       const who = accountId === interaction.user.id ? "your" : `<@${accountId}>'s`;
       await interaction.reply({ content: `Settled all ${charges.length} active bill(s) and tax(es) for ${who}, totaling ${total.toLocaleString()}. Their next scheduled deductions are one interval from now.`, allowedMentions: { users: accountId === interaction.user.id ? [] : [accountId] }, ...ephemeral });
+      for (const charge of charges) {
+        await sendUserNotice(interaction.client, accountId,
+          `PTB transaction: settled ${charge.kind} **${charge.name}** for ${Number(charge.amount).toLocaleString()}. This charge is recorded in your transaction history.`);
+      }
     } catch (error) {
       await tx.rollback().catch(() => {});
       throw error;
@@ -140,7 +183,7 @@ export async function handleBillCommand(db, interaction) {
 
 // Run at startup and every minute. The charge row's due timestamp is a claim
 // token, so overlapping workers cannot debit the same occurrence twice.
-export async function processDueCharges(db, now = new Date()) {
+export async function processDueCharges(db, now = new Date(), client = null) {
   const due = await db.execute({
     sql: "SELECT id, discord_id, kind, name, amount, interval, next_due_at FROM recurring_charges WHERE active = 1 AND next_due_at <= ? ORDER BY next_due_at LIMIT 100",
     args: [now.toISOString()],
@@ -164,6 +207,9 @@ export async function processDueCharges(db, now = new Date()) {
       });
       await tx.commit();
       processed += 1;
+      const outcome = debit.rowsAffected === 1 ? "deducted" : "could not be deducted because the account is frozen or funds were insufficient";
+      await sendUserNotice(client, charge.discord_id,
+        `PTB transaction: recurring ${charge.kind} **${charge.name}** for ${Number(charge.amount).toLocaleString()} ${outcome}. Check your transaction history for the recorded result.`);
     } catch (error) {
       await tx.rollback().catch(() => {});
       throw error;
