@@ -40,18 +40,180 @@ const requiredEnv = [
   "TURSO_AUTH_TOKEN",
 ];
 
-for (const name of requiredEnv) {
-  if (!process.env[name]) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
+const missingEnv = requiredEnv.filter((name) => !process.env[name]);
+if (missingEnv.length > 0) {
+  console.warn(`[PTB Info] Missing environment variables: ${missingEnv.join(", ")}`);
+  console.warn("[PTB Info] Running with local SQLite fallback. Set DISCORD_TOKEN, CLIENT_ID, GUILD_ID in .env to connect Discord.");
 }
 
-const port = Number.parseInt(process.env.PORT ?? "3000", 10);
-if (!Number.isInteger(port) || port < 1 || port > 65535) {
-  throw new Error("PORT must be a valid TCP port number");
-}
+const port = 3000;
 
 let ready = false;
+let dbConnected = false;
+
+function renderDashboardHtml() {
+  const discordStatus = client.isReady()
+    ? `<span class="badge badge-success">● Connected (${escapeHtml(client.user?.tag ?? "Online")})</span>`
+    : (process.env.DISCORD_TOKEN
+      ? `<span class="badge badge-warning">● Connecting / Standby</span>`
+      : `<span class="badge badge-neutral">○ Standby (Configure DISCORD_TOKEN)</span>`);
+
+  const dbStatus = dbConnected
+    ? (process.env.TURSO_URL
+      ? `<span class="badge badge-success">● Turso Cloud DB</span>`
+      : `<span class="badge badge-success">● Local SQLite (ptb-local.db)</span>`)
+    : `<span class="badge badge-warning">● Initializing</span>`;
+
+  const robloxStatus = oauthConfigured()
+    ? `<span class="badge badge-success">● OAuth Active</span>`
+    : `<span class="badge badge-neutral">○ Standby (Configure ROBLOX_CLIENT_ID)</span>`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pacific Trust Bank | Discord Ledger</title>
+  <style>
+    :root {
+      --bg: #0b1319;
+      --surface: #111e27;
+      --surface-border: #1e3342;
+      --primary: #10b981;
+      --primary-dark: #059669;
+      --text: #e2e8f0;
+      --text-muted: #94a3b8;
+      --accent: #38bdf8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 2rem 1rem;
+    }
+    .container { max-width: 960px; margin: 0 auto; }
+    header {
+      border-bottom: 1px solid var(--surface-border);
+      padding-bottom: 1.5rem;
+      margin-bottom: 2rem;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+    }
+    .logo-group h1 { font-size: 1.75rem; font-weight: 700; color: #fff; letter-spacing: -0.02em; }
+    .logo-group p { color: var(--text-muted); font-size: 0.95rem; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.3rem 0.75rem;
+      border-radius: 9999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .badge-success { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-warning { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+    .badge-neutral { background: rgba(148, 163, 184, 0.15); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.3); }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--surface-border);
+      border-radius: 8px;
+      padding: 1.25rem;
+    }
+    .card h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 0.5rem; }
+    .card .val { font-size: 1.05rem; font-weight: 600; color: #fff; }
+    .section-title { font-size: 1.2rem; font-weight: 600; color: #fff; margin: 2rem 0 1rem; }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 0.75rem 1rem; border-bottom: 1px solid var(--surface-border); }
+    th { background: rgba(0,0,0,0.2); color: var(--text-muted); font-weight: 600; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background: rgba(255,255,255,0.08); padding: 0.15rem 0.4rem; border-radius: 4px; color: var(--accent); }
+    .footer { text-align: center; margin-top: 3rem; color: var(--text-muted); font-size: 0.85rem; border-top: 1px solid var(--surface-border); padding-top: 1.5rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo-group">
+        <h1>🏦 Pacific Trust Bank</h1>
+        <p>Roleplay Ledger & Discord Bot for Emergency Hamburg RP</p>
+      </div>
+      <div>
+        <span class="badge ${ready ? "badge-success" : "badge-warning"}">${ready ? "● Operational" : "○ Initializing"}</span>
+      </div>
+    </header>
+
+    <div class="status-grid">
+      <div class="card">
+        <h3>Discord Gateway</h3>
+        <div class="val">${discordStatus}</div>
+      </div>
+      <div class="card">
+        <h3>Database Storage</h3>
+        <div class="val">${dbStatus}</div>
+      </div>
+      <div class="card">
+        <h3>Roblox Verification</h3>
+        <div class="val">${robloxStatus}</div>
+      </div>
+      <div class="card">
+        <h3>HTTP Port</h3>
+        <div class="val"><code>0.0.0.0:${port}</code></div>
+      </div>
+    </div>
+
+    <h2 class="section-title">Available Slash Commands</h2>
+    <div class="card" style="padding: 0; overflow-x: auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Command</th>
+            <th>Type</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/ping</code></td><td>General</td><td>Check if the bot is responding</td></tr>
+          <tr><td><code>/help</code></td><td>General</td><td>Interactive command guide filtered by permission</td></tr>
+          <tr><td><code>/register</code></td><td>Account</td><td>Link your Roblox account using OAuth PKCE</td></tr>
+          <tr><td><code>/verify</code></td><td>Account</td><td>Check or update linked Roblox status</td></tr>
+          <tr><td><code>/balance</code></td><td>Account</td><td>Privately inspect your PTB ledger balance</td></tr>
+          <tr><td><code>/transaction history</code></td><td>Account</td><td>Paginated statement of deposits, withdrawals, transfers</td></tr>
+          <tr><td><code>/deposit [amount]</code></td><td>Tickets</td><td>Open a private deposit channel with admin approval</td></tr>
+          <tr><td><code>/withdraw [amount]</code></td><td>Tickets</td><td>Open a private withdrawal channel with anti-overdraw payout</td></tr>
+          <tr><td><code>/transfer [user] [amt]</code></td><td>Ledger</td><td>Transfer funds atomically with replay prevention</td></tr>
+          <tr><td><code>/add-balance [user] [amt]</code></td><td>Admin</td><td>Admin command to credit an account directly</td></tr>
+          <tr><td><code>/bill [list|settle]</code></td><td>Recurring</td><td>View or settle due recurring bills</td></tr>
+          <tr><td><code>/tax [list|settle]</code></td><td>Recurring</td><td>View or settle due recurring city taxes</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 class="section-title">Endpoints & Integration</h2>
+    <div class="card">
+      <ul style="list-style: none; display: flex; flex-direction: column; gap: 0.75rem;">
+        <li><strong>Health Check:</strong> <code>GET /health</code> &mdash; Returns HTTP 200 <code>ok</code> when the ledger is ready.</li>
+        <li><strong>Roblox OAuth Callback:</strong> <code>GET /oauth/roblox/callback</code> &mdash; Secure OAuth 2.0 PKCE redirection endpoint.</li>
+      </ul>
+    </div>
+
+    <div class="footer">
+      Pacific Trust Bank &bull; Roleplay ledger system &bull; Emergency Hamburg RP
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
 const healthServer = createServer((request, response) => {
   const requestUrl = new URL(request.url ?? "/", "http://localhost");
   if (request.method === "GET" && requestUrl.pathname === "/oauth/roblox/callback") {
@@ -59,9 +221,15 @@ const healthServer = createServer((request, response) => {
     return;
   }
 
-  if (request.url === "/health" || request.url === "/") {
+  if (request.url === "/health") {
     response.writeHead(ready ? 200 : 503, { "content-type": "text/plain; charset=utf-8" });
     response.end(ready ? "ok" : "starting");
+    return;
+  }
+
+  if (request.url === "/" || requestUrl.pathname === "/" || requestUrl.pathname === "/index.html") {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(renderDashboardHtml());
     return;
   }
 
@@ -73,9 +241,10 @@ healthServer.listen(port, "0.0.0.0", () => {
   console.log(`Health-check server listening on port ${port}`);
 });
 
+const dbUrl = process.env.TURSO_URL || "file:ptb-local.db";
 const db = createClient({
-  url: process.env.TURSO_URL,
-  authToken: process.env.TURSO_AUTH_TOKEN,
+  url: dbUrl,
+  authToken: process.env.TURSO_AUTH_TOKEN || undefined,
 });
 
 const pingCommand = new SlashCommandBuilder()
@@ -706,43 +875,60 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 try {
   await db.batch([...schemaStatements, ...ticketSchemaStatements, ...recurringChargeSchemaStatements], "write");
+  dbConnected = true;
+  console.log("PTB ledger database initialized successfully.");
 
-  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(
-    Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-    {
-      body: [
-        helpCommand.toJSON(),
-        pingCommand.toJSON(),
-        registerCommand.toJSON(),
-        verifyCommand.toJSON(),
-        balanceCommand.toJSON(),
-        transactionCommand.toJSON(),
-        depositCommand.toJSON(),
-        withdrawCommand.toJSON(),
-        addBalanceCommand.toJSON(),
-        transferCommand.toJSON(),
-        billCommand.toJSON(),
-        taxCommand.toJSON(),
-      ],
-    },
+  const hasDiscordConfig = Boolean(
+    process.env.DISCORD_TOKEN &&
+    process.env.CLIENT_ID &&
+    process.env.GUILD_ID,
   );
 
-  await client.login(process.env.DISCORD_TOKEN);
-  ready = true;
-  const runRecurringCharges = async () => {
+  if (hasDiscordConfig) {
     try {
-      await sendDueChargeReminders(db, client);
-      await processDueCharges(db, new Date(), client);
-    } catch (error) {
-      console.error("Recurring bill/tax processing failed:", error);
+      const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+      await rest.put(
+        Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+        {
+          body: [
+            helpCommand.toJSON(),
+            pingCommand.toJSON(),
+            registerCommand.toJSON(),
+            verifyCommand.toJSON(),
+            balanceCommand.toJSON(),
+            transactionCommand.toJSON(),
+            depositCommand.toJSON(),
+            withdrawCommand.toJSON(),
+            addBalanceCommand.toJSON(),
+            transferCommand.toJSON(),
+            billCommand.toJSON(),
+            taxCommand.toJSON(),
+          ],
+        },
+      );
+      console.log("Discord slash commands registered successfully.");
+
+      await client.login(process.env.DISCORD_TOKEN);
+
+      const runRecurringCharges = async () => {
+        try {
+          await sendDueChargeReminders(db, client);
+          await processDueCharges(db, new Date(), client);
+        } catch (error) {
+          console.error("Recurring bill/tax processing failed:", error);
+        }
+      };
+      void runRecurringCharges();
+      setInterval(runRecurringCharges, 60_000).unref();
+    } catch (discordError) {
+      console.error("Discord bot login/command registration failed:", discordError.message || discordError);
     }
-  };
-  void runRecurringCharges();
-  setInterval(runRecurringCharges, 60_000).unref();
+  } else {
+    console.log("[PTB Standby] Discord credentials (DISCORD_TOKEN, CLIENT_ID, GUILD_ID) not fully configured in .env. Bot gateway on standby.");
+  }
+
+  ready = true;
 } catch (error) {
-  console.error("PTB startup failed:", error);
-  healthServer.close();
-  await db.close();
-  process.exitCode = 1;
+  console.error("PTB startup database initialization failed:", error);
+  ready = false;
 }

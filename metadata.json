@@ -1,0 +1,8 @@
+{
+  "name": "Pacific Trust Bank IRP",
+  "description": "Roleplay bank ledger and Discord bot with Roblox account verification, balance management, recurring bills, and deposit/withdrawal tickets for Emergency Hamburg RP.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
