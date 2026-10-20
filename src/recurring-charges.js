@@ -130,8 +130,8 @@ export async function handleBillCommand(db, interaction, kind) {
         args: [interaction.id],
       });
       await tx.commit();
-      const who = accountId === interaction.user.id ? "your" : `<@${accountId}>'s`;
-      await interaction.reply({ content: `Settled ${charges.length} ${kind === "tax" ? "tax(es)" : "bill(s)"} for ${who}, totaling ${total.toLocaleString()}. Their next scheduled deductions are one interval from now.`, allowedMentions: { users: accountId === interaction.user.id ? [] : [accountId] }, ...ephemeral });
+      const who = accountId === interaction.user.id ? "you" : `<@${accountId}>`;
+      await interaction.reply({ content: `Settled ${charges.length} ${kind === "tax" ? "tax(es)" : "bill(s)"} for ${who}, totaling ${total.toLocaleString()}. Next scheduled deductions are one interval from now.`, allowedMentions: { users: accountId === interaction.user.id ? [] : [accountId] }, ...ephemeral });
       for (const charge of charges) {
         await sendUserNotice(interaction.client, accountId,
           `PTB transaction: settled ${charge.kind} **${charge.name}** for ${Number(charge.amount).toLocaleString()}. This charge is recorded in your transaction history.`);
@@ -182,8 +182,11 @@ export async function processDueCharges(db, now = new Date(), client = null) {
       await sendUserNotice(client, charge.discord_id,
         `PTB transaction: recurring ${charge.kind} **${charge.name}** for ${Number(charge.amount).toLocaleString()} ${outcome}. Check your transaction history for the recorded result.`);
     } catch (error) {
+      // Fail closed for this occurrence (it is retried on the next run) and
+      // keep processing the remaining due charges instead of aborting the
+      // whole sweep, which would starve every charge queued behind it.
       await tx.rollback().catch(() => {});
-      throw error;
+      console.error(`PTB recurring charge #${charge.id} processing failed:`, error);
     } finally {
       tx.close();
     }

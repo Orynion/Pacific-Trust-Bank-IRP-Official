@@ -12,6 +12,9 @@ export const MAX_BALANCE = 2_147_483_647;
 export const ephemeralReply = { flags: MessageFlags.Ephemeral };
 
 export const schemaStatements = [
+  // Retire abandoned, short-lived state from the removed Roblox OAuth flow.
+  `DROP TABLE IF EXISTS oauth_sessions`,
+  `DROP TABLE IF EXISTS pending_links`,
   `CREATE TABLE IF NOT EXISTS accounts (
     discord_id TEXT PRIMARY KEY,
     roblox_id TEXT,
@@ -30,19 +33,6 @@ export const schemaStatements = [
     staff_id TEXT,
     note TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  )`,
-  `CREATE TABLE IF NOT EXISTS oauth_sessions (
-    state TEXT PRIMARY KEY,
-    discord_id TEXT NOT NULL,
-    code_verifier TEXT NOT NULL,
-    expires_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS pending_links (
-    id TEXT PRIMARY KEY,
-    discord_id TEXT NOT NULL,
-    roblox_id TEXT NOT NULL,
-    roblox_username TEXT NOT NULL,
-    expires_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS processed_interactions (
     interaction_id TEXT PRIMARY KEY,
@@ -179,7 +169,18 @@ export async function handleMoneyRequest(db, interaction, type) {
     await rejectTicketWithNote(db, ticketId, "Ticket channel could not be created").catch(() => {});
     throw error;
   }
-  await attachTicketChannel(db, ticketId, channel.id);
+  try {
+    await attachTicketChannel(db, ticketId, channel.id);
+  } catch (error) {
+    // A pending ticket with no attached channel would bypass the channel
+    // binding check in ticket-ops, so fail closed: reject the ticket and
+    // remove the Discord channel so nothing can be decided from it.
+    console.error("Could not attach the PTB ticket channel:", error);
+    await rejectTicketWithNote(db, ticketId, "Ticket channel could not be linked to the ticket record").catch(() => {});
+    await channel.delete("PTB ticket could not be linked to its record").catch(() => {});
+    await interaction.editReply("I could not open the ticket right now because the ledger database rejected it. Please try again shortly.");
+    return;
+  }
 
   try {
     const requestDetails = type === "deposit"

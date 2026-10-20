@@ -9,9 +9,9 @@
   },
   "scripts": {
     "dev": "node src/index.js",
-    "build": "node --check src/index.js",
+    "build": "node --check src/index.js && node --check src/bank-ops.js && node --check src/ticket-ops.js && node --check src/transaction-history.js && node --check src/recurring-charges.js && node --check src/bloxlink-registration.js",
     "start": "node src/index.js",
-    "test": "node --test src/bank-logic.test.js src/transaction-history.test.js src/ticket-ops.test.js src/security-exploits.test.js"
+    "test": "node --test src/bank-logic.test.js src/transaction-history.test.js src/ticket-ops.test.js src/security-exploits.test.js src/bloxlink-registration.test.js"
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",

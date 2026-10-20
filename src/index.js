@@ -1,11 +1,7 @@
 import "dotenv/config";
-import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { createClient } from "@libsql/client";
 import {
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
   Client,
   EmbedBuilder,
   Events,
@@ -18,14 +14,6 @@ import {
 import { getTransactionHistory, handleHistoryButton } from "./transaction-history.js";
 import { handleBillCommand, processDueCharges, recurringChargeSchemaStatements, sendDueChargeReminders } from "./recurring-charges.js";
 import {
-  isAllowedCallbackHost,
-  buildTokenRequestBody,
-  buildRobloxAuthorizationUrl,
-  checkRobloxOAuthConfigAtStartup,
-  getRobloxOAuthCredentials,
-  validateRobloxOAuthConfig,
-} from "./oauth-security.js";
-import {
   ephemeralReply,
   handleAddBalance,
   handleBalance,
@@ -33,33 +21,28 @@ import {
   handleTransfer,
   schemaStatements,
 } from "./bank-ops.js";
-import {
-  handleTicketClose,
-  handleTicketDecision,
-  ticketSchemaStatements,
-} from "./ticket-ops.js";
+import { createRegistrationEventHandler, validateRegistrationConfig, validateRoleAssignmentAccess } from "./bloxlink-registration.js";
+import { handleTicketClose, handleTicketDecision, ticketSchemaStatements } from "./ticket-ops.js";
 
-const requiredEnv = [
-  "DISCORD_TOKEN",
-  "CLIENT_ID",
-  "GUILD_ID",
-  "TURSO_URL",
-  "TURSO_AUTH_TOKEN",
-];
-
+const requiredEnv = ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID", "TURSO_URL", "TURSO_AUTH_TOKEN"];
 const missingEnv = requiredEnv.filter((name) => !process.env[name]);
-if (missingEnv.length > 0) {
+if (missingEnv.length) {
   console.warn(`[PTB Info] Missing environment variables: ${missingEnv.join(", ")}`);
-  console.warn("[PTB Info] Running with local SQLite fallback. Set DISCORD_TOKEN, CLIENT_ID, GUILD_ID in .env to connect Discord.");
+  console.warn("[PTB Info] Running with local SQLite fallback. Set Discord and Bloxlink configuration to connect.");
 }
-
-// Check Roblox OAuth configuration on startup without exposing secrets
-checkRobloxOAuthConfigAtStartup(process.env);
-
-const port = 3000;
+const port = Number(process.env.PORT || 3000);
 
 let ready = false;
 let dbConnected = false;
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
 
 function renderDashboardHtml() {
   const discordStatus = client.isReady()
@@ -74,9 +57,9 @@ function renderDashboardHtml() {
       : `<span class="badge badge-success">● Local SQLite (ptb-local.db)</span>`)
     : `<span class="badge badge-warning">● Initializing</span>`;
 
-  const robloxStatus = oauthConfigured()
-    ? `<span class="badge badge-success">● OAuth Active</span>`
-    : `<span class="badge badge-neutral">○ Standby (Configure ROBLOX_CLIENT_ID)</span>`;
+  const robloxStatus = process.env.BLOXLINK_API_KEY
+    ? `<span class="badge badge-success">● Bloxlink API Active</span>`
+    : `<span class="badge badge-neutral">○ Standby (Configure Bloxlink API)</span>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -194,8 +177,8 @@ function renderDashboardHtml() {
         <tbody>
           <tr><td><code>/ping</code></td><td>General</td><td>Check if the bot is responding</td></tr>
           <tr><td><code>/help</code></td><td>General</td><td>Interactive command guide filtered by permission</td></tr>
-          <tr><td><code>/register</code></td><td>Account</td><td>Link your Roblox account using OAuth PKCE</td></tr>
-          <tr><td><code>/verify</code></td><td>Account</td><td>Check or update linked Roblox status</td></tr>
+          <tr><td><code>/register</code></td><td>Account</td><td>Register after Bloxlink verification</td></tr>
+          <tr><td><code>/verify</code></td><td>Account</td><td>Check your PTB link or learn how to register through Bloxlink</td></tr>
           <tr><td><code>/balance</code></td><td>Account</td><td>Privately inspect your PTB ledger balance</td></tr>
           <tr><td><code>/transaction history</code></td><td>Account</td><td>Paginated statement of deposits, withdrawals, transfers</td></tr>
           <tr><td><code>/deposit [amount]</code></td><td>Tickets</td><td>Open a private deposit channel with admin approval</td></tr>
@@ -212,7 +195,6 @@ function renderDashboardHtml() {
     <div class="card">
       <ul style="list-style: none; display: flex; flex-direction: column; gap: 0.75rem;">
         <li><strong>Health Check:</strong> <code>GET /health</code> &mdash; Returns HTTP 200 <code>ok</code> when the ledger is ready.</li>
-        <li><strong>Roblox OAuth Callback:</strong> <code>GET /oauth/roblox/callback</code> &mdash; Secure OAuth 2.0 PKCE redirection endpoint.</li>
       </ul>
     </div>
 
@@ -225,26 +207,30 @@ function renderDashboardHtml() {
 }
 
 const healthServer = createServer((request, response) => {
-  const requestUrl = new URL(request.url ?? "/", "http://localhost");
-  if (request.method === "GET" && requestUrl.pathname === "/oauth/roblox/callback") {
-    void handleRobloxOAuthCallback(request, response);
-    return;
-  }
+  try {
+    const requestUrl = new URL(request.url ?? "/", "http://localhost");
+    if (requestUrl.pathname === "/health") {
+      response.writeHead(ready ? 200 : 503, { "content-type": "text/plain; charset=utf-8" });
+      response.end(ready ? "ok" : "starting");
+      return;
+    }
 
-  if (request.url === "/health") {
-    response.writeHead(ready ? 200 : 503, { "content-type": "text/plain; charset=utf-8" });
-    response.end(ready ? "ok" : "starting");
-    return;
-  }
+    if (requestUrl.pathname === "/" || requestUrl.pathname === "/index.html") {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(renderDashboardHtml());
+      return;
+    }
 
-  if (request.url === "/" || requestUrl.pathname === "/" || requestUrl.pathname === "/index.html") {
-    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    response.end(renderDashboardHtml());
-    return;
+    response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    response.end("not found");
+  } catch (error) {
+    // A request-handler throw must never take the health server (or the bot) down.
+    console.error("PTB dashboard request failed:", error);
+    if (!response.headersSent) {
+      response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+    }
+    response.end("internal server error");
   }
-
-  response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-  response.end("not found");
 });
 
 healthServer.listen(port, "0.0.0.0", () => {
@@ -267,11 +253,11 @@ const helpCommand = new SlashCommandBuilder()
 
 const registerCommand = new SlashCommandBuilder()
   .setName("register")
-  .setDescription("Link your Roblox account to PTB with Roblox OAuth.");
+  .setDescription("Check your PTB registration status or learn how to register.");
 
 const verifyCommand = new SlashCommandBuilder()
   .setName("verify")
-  .setDescription("Start Roblox verification for your PTB account.");
+  .setDescription("Check your PTB link or learn how to register through Bloxlink.");
 
 const balanceCommand = new SlashCommandBuilder()
   .setName("balance")
@@ -298,11 +284,6 @@ function createMoneyRequestCommand(name, description) {
 
 const depositCommand = createMoneyRequestCommand("deposit", "Open a private ticket to request a deposit.");
 const withdrawCommand = createMoneyRequestCommand("withdraw", "Open a private ticket to request a withdrawal.");
-
-const verifyButton = new ButtonBuilder()
-  .setCustomId("verify_with_roblox")
-  .setLabel("Verify with Roblox")
-  .setStyle(ButtonStyle.Primary);
 
 const addBalanceCommand = new SlashCommandBuilder()
   .setName("add-balance")
@@ -361,8 +342,8 @@ function createHelpEmbed(isAdministrator) {
       {
         name: "Account",
         value: [
-          "`/register` — Link your Roblox account to PTB.\nExample: `/register`",
-          "`/verify` — Start Roblox verification for your PTB account.\nExample: `/verify`",
+          "`/register` — Check your PTB registration or learn how to register.\nExample: `/register`",
+          "`/verify` — Check your PTB link or learn how to register through Bloxlink.\nExample: `/verify`",
           "`/balance` — Privately check your own PTB balance.\nExample: `/balance`",
           "`/bill list` and `/tax list` — View recurring bills and taxes separately. Use `/bill settle` or `/tax settle` to settle due charges of that type.",
         ].join("\n\n"),
@@ -400,353 +381,61 @@ async function handleTransactionHistory(interaction) {
   await interaction.reply(await getTransactionHistory(db, interaction.user.id, 0));
 }
 
-function createAlreadyVerifiedReply(accountName) {
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("change_roblox_account")
-      .setLabel("Change Account")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("cancel_change_account")
-      .setLabel("Cancel")
-      .setStyle(ButtonStyle.Secondary),
-  );
-
-  return {
-    content: `You are already verified with the account **${accountName}**. Do you want to change it?`,
-    components: [row],
-    ...ephemeralReply,
-  };
-}
-
 async function handleVerify(interaction) {
   const accountResult = await db.execute({
     sql: "SELECT roblox_username FROM accounts WHERE discord_id = ? LIMIT 1",
     args: [interaction.user.id],
   });
-  if (accountResult.rows.length > 0) {
-    const accountName = accountResult.rows[0].roblox_username || "Unknown";
-    await interaction.reply(createAlreadyVerifiedReply(accountName));
+  if (accountResult.rows.length) {
+    await interaction.reply({ content: `Your PTB account is linked to **${accountResult.rows[0].roblox_username || "a Roblox account"}**.`, ...ephemeralReply });
     return;
   }
-
-  await interaction.reply({
-    content: "Click below to verify your Roblox account and link it to PTB.",
-    components: [new ActionRowBuilder().addComponents(verifyButton)],
-    ...ephemeralReply,
-  });
-}
-
-const oauthConfigured = () => validateRobloxOAuthConfig().ok;
-
-async function startOAuthFlow(interaction, isChange = false) {
-  const config = validateRobloxOAuthConfig();
-  if (!config.ok) {
-    let missingHint = "";
-    if (!config.hasClientId) {
-      missingHint = " (ROBLOX_CLIENT_ID is missing or invalid)";
-    }
-    const content = `Roblox OAuth is not configured yet${missingHint}. The PTB administrator must configure Roblox OAuth app settings before accounts can be linked.`;
-    if (interaction.isButton() && interaction.customId === "change_roblox_account") {
-      await interaction.update({ content, components: [] });
-    } else if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content, ...ephemeralReply });
-    } else {
-      await interaction.followUp({ content, ...ephemeralReply });
-    }
+  if (!registrationConfig.ok) {
+    await interaction.reply({ content: "PTB account registration is not configured yet. Please contact a PTB administrator.", ...ephemeralReply });
     return;
   }
-
-  const discordId = interaction.user.id;
-  const state = randomBytes(32).toString("base64url");
-  const codeVerifier = randomBytes(48).toString("base64url");
-  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
-  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-  await db.batch([
-    {
-      sql: "DELETE FROM oauth_sessions WHERE expires_at <= ? OR discord_id = ?",
-      args: [new Date().toISOString(), discordId],
-    },
-    {
-      sql: "DELETE FROM pending_links WHERE expires_at <= ?",
-      args: [new Date().toISOString()],
-    },
-    {
-      sql: `INSERT INTO oauth_sessions (state, discord_id, code_verifier, expires_at)
-        VALUES (?, ?, ?, ?)`,
-      args: [state, discordId, codeVerifier, expiresAt],
-    },
-  ], "write");
-
-  let authorizeUrl;
-  try {
-    authorizeUrl = buildRobloxAuthorizationUrl({
-      clientId: config.clientId,
-      redirectUri: config.redirectUri,
-      state,
-      codeChallenge,
-      scopes: "openid profile",
-    });
-  } catch (urlError) {
-    console.error("Roblox authorization URL generation failed:", urlError.message);
-    const content = "Could not generate Roblox authorization URL due to invalid client configuration. Please contact a PTB administrator.";
-    if (interaction.isButton() && interaction.customId === "change_roblox_account") {
-      await interaction.update({ content, components: [] });
-    } else if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content, ...ephemeralReply });
-    } else {
-      await interaction.followUp({ content, ...ephemeralReply });
-    }
-    return;
-  }
-
-  const actionText = isChange ? "link a different Roblox account" : "link your Roblox account";
-  const content = `Authorize PTB to ${actionText}: ${authorizeUrl}\nThis link expires in 10 minutes.`;
-
-  if (interaction.isButton() && interaction.customId === "change_roblox_account") {
-    await interaction.update({ content, components: [] });
-  } else if (!interaction.replied && !interaction.deferred) {
-    await interaction.reply({ content, ...ephemeralReply });
-  } else {
-    await interaction.followUp({ content, ...ephemeralReply });
-  }
+  await interaction.reply({ content: "First verify with Bloxlink in this server. PTB will register you after the configured Bloxlink verification role is added.", ...ephemeralReply });
 }
 
 async function handleRegister(interaction) {
-  if (!oauthConfigured()) {
-    await interaction.reply({
-      content: "Roblox OAuth is not configured yet. The PTB administrator must add the Roblox OAuth app settings before accounts can be linked.",
-      ...ephemeralReply,
-    });
-    return;
-  }
-
-  const discordId = interaction.user.id;
-  const accountResult = await db.execute({
-    sql: "SELECT roblox_username FROM accounts WHERE discord_id = ? LIMIT 1",
-    args: [discordId],
-  });
-  if (accountResult.rows.length > 0) {
-    const accountName = accountResult.rows[0].roblox_username || "Unknown";
-    await interaction.reply(createAlreadyVerifiedReply(accountName));
-    return;
-  }
-
-  await startOAuthFlow(interaction, false);
+  await handleVerify(interaction);
 }
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+const registrationConfig = validateRegistrationConfig(process.env);
+if (!registrationConfig.ok) console.error(`[PTB Config] Registration unavailable; set valid guild, role IDs, and Bloxlink API key: ${registrationConfig.missing.join(", ")}`);
+let registrationRolesReady = false;
+const handleGuildMemberUpdate = createRegistrationEventHandler({
+  db,
+  enabled: () => registrationConfig.ok && registrationRolesReady,
+  guildId: process.env.GUILD_ID,
+  verifiedRoleId: process.env.BLOXLINK_VERIFIED_ROLE_ID,
+  registeredRoleId: process.env.REGISTERED_ROLE_ID,
+  apiKey: process.env.BLOXLINK_API_KEY,
+});
+client.on(Events.GuildMemberUpdate, (oldMember, newMember) => void handleGuildMemberUpdate(oldMember, newMember));
 
-function sendOAuthResult(response, status, message) {
-  response.writeHead(status, {
-    "content-type": "text/html; charset=utf-8",
-    "cache-control": "no-store",
-    "referrer-policy": "no-referrer",
-    "x-content-type-options": "nosniff",
-  });
-  response.end(`<!doctype html><html><head><meta charset="utf-8"><title>PTB Roblox link</title></head><body><main><h1>PTB Roblox link</h1><p>${message}</p></main></body></html>`);
-}
-
-async function consumeOAuthState(state) {
-  const transaction = await db.transaction("write");
-  try {
-    const result = await transaction.execute({
-      sql: "SELECT discord_id, code_verifier, expires_at FROM oauth_sessions WHERE state = ?",
-      args: [state],
-    });
-    const session = result.rows[0];
-    await transaction.execute({ sql: "DELETE FROM oauth_sessions WHERE state = ?", args: [state] });
-    await transaction.commit();
-    if (!session || Date.parse(session.expires_at) <= Date.now()) return null;
-    return session;
-  } finally {
-    transaction.close();
-  }
-}
-
-async function requestOAuthJson(url, options) {
-  const response = await fetch(url, {
-    ...options,
-    signal: AbortSignal.timeout(10_000),
-    headers: { accept: "application/json", ...options?.headers },
-  });
-  if (!response.ok) throw new Error(`Roblox OAuth returned HTTP ${response.status}`);
-  return response.json();
-}
-
-async function handleRobloxOAuthCallback(request, response) {
-  const requestUrl = new URL(request.url ?? "/", "http://localhost");
-  try {
-    if (!oauthConfigured()) {
-      sendOAuthResult(response, 503, "Roblox account linking is not configured on PTB yet. Return to Discord and contact a PTB administrator.");
-      return;
-    }
-
-    // Host binding: this endpoint is registered for exactly one public
-    // address (the redirect URI). Requests arriving with an attacker-chosen
-    // Host header (rogue domains parked at this address, DNS rebinding, port
-    // confusion) are refused before any OAuth state is consumed.
-    const credentials = getRobloxOAuthCredentials();
-    const hostHeader = request.headers.host ?? "";
-    if (!isAllowedCallbackHost(`http://${hostHeader}`, credentials.redirectUri)) {
-      sendOAuthResult(response, 400, "This PTB link page must be opened through its registered address. Return to Discord and run /register again.");
-      return;
-    }
-
-    const state = requestUrl.searchParams.get("state");
-    if (!state) {
-      sendOAuthResult(response, 400, "The authorization request was invalid. Run /register in Discord and try again.");
-      return;
-    }
-
-    const session = await consumeOAuthState(state);
-    if (!session) {
-      sendOAuthResult(response, 400, "This authorization link expired or was already used. Run /register in Discord and try again.");
-      return;
-    }
-
-    if (requestUrl.searchParams.has("error")) {
-      sendOAuthResult(response, 400, "Roblox authorization was cancelled. You can run /register in Discord to try again.");
-      return;
-    }
-
-    const code = requestUrl.searchParams.get("code");
-    if (!code) {
-      sendOAuthResult(response, 400, "Roblox did not return an authorization code. Run /register in Discord and try again.");
-      return;
-    }
-
-    // redirect_uri is required here per RFC 6749 §4.1.3 because the
-    // authorization request included it; it must match the registered value.
-    const tokenBody = buildTokenRequestBody(code, session.code_verifier, credentials.redirectUri, credentials.clientId, credentials.clientSecret);
-    const tokens = await requestOAuthJson("https://apis.roblox.com/oauth/v1/token", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: tokenBody,
-    });
-    if (typeof tokens.access_token !== "string") throw new Error("Roblox OAuth token response was invalid");
-
-    const identity = await requestOAuthJson("https://apis.roblox.com/oauth/v1/userinfo", {
-      headers: { authorization: `Bearer ${tokens.access_token}` },
-    });
-    const robloxId = String(identity.sub ?? "");
-    const robloxUsername = identity.preferred_username;
-    if (!/^\d+$/.test(robloxId) || typeof robloxUsername !== "string" || !robloxUsername) {
-      throw new Error("Roblox user information response was incomplete");
-    }
-
-    const pendingId = randomBytes(32).toString("base64url");
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-    await db.execute({
-      sql: `INSERT INTO pending_links (id, discord_id, roblox_id, roblox_username, expires_at)
-        VALUES (?, ?, ?, ?, ?)`,
-      args: [pendingId, session.discord_id, robloxId, robloxUsername, expiresAt],
-    });
-
-    let dmSent = true;
-    try {
-      const user = await client.users.fetch(session.discord_id);
-      await user.send({
-        content: `We received a request to link your Roblox account **${robloxUsername}** to PTB. If this was you, click below to confirm. If not, ignore this message.`,
-        components: [new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`confirm_link_${pendingId}`)
-            .setLabel("Confirm linking")
-            .setStyle(ButtonStyle.Success),
-        )],
-      });
-    } catch (dmError) {
-      dmSent = false;
-      console.error("Could not send confirmation DM:", dmError);
-    }
-
-    const dmInstruction = dmSent
-      ? "Return to Discord and click the confirmation button we sent you."
-      : "We could not send you a Discord DM. Please enable Direct Messages from server members in your Discord privacy settings, then run /register in Discord again.";
-    sendOAuthResult(response, 200, `Your Roblox account <strong>${escapeHtml(robloxUsername)}</strong> is ready. ${dmInstruction}`);
-  } catch (error) {
-    console.error("Roblox OAuth callback failed:", error.message);
-    if (!response.headersSent) {
-      sendOAuthResult(response, 502, "Roblox could not complete the account link right now. Run /register in Discord to try again.");
-    }
-  }
-}
-
-function escapeHtml(value) {
-  return value.replace(/[&<>"']/g, (character) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  })[character]);
-}
-
-async function handleConfirmLink(interaction, pendingId) {
-  const transaction = await db.transaction("write");
-  try {
-    const result = await transaction.execute({
-      sql: "SELECT discord_id, roblox_id, roblox_username, expires_at FROM pending_links WHERE id = ?",
-      args: [pendingId],
-    });
-    const pending = result.rows[0];
-    await transaction.execute({ sql: "DELETE FROM pending_links WHERE id = ?", args: [pendingId] });
-    await transaction.commit();
-
-    if (!pending || Date.parse(pending.expires_at) <= Date.now()) {
-      await interaction.reply({ content: "This confirmation link expired. Run /register again.", ...ephemeralReply });
-      return;
-    }
-    if (pending.discord_id !== interaction.user.id) {
-      await interaction.reply({ content: "This confirmation was not for your account.", ...ephemeralReply });
-      return;
-    }
-
-    const existingRoblox = await db.execute({
-      sql: "SELECT discord_id FROM accounts WHERE roblox_id = ? LIMIT 1",
-      args: [pending.roblox_id],
-    });
-    if (existingRoblox.rows.length > 0 && existingRoblox.rows[0].discord_id !== interaction.user.id) {
-      await interaction.reply({ content: "That Roblox account is already linked to another PTB account.", ...ephemeralReply });
-      return;
-    }
-
-    const existingDiscord = await db.execute({
-      sql: "SELECT 1 FROM accounts WHERE discord_id = ? LIMIT 1",
-      args: [interaction.user.id],
-    });
-    if (existingDiscord.rows.length > 0) {
-      await db.execute({
-        sql: "UPDATE accounts SET roblox_id = ?, roblox_username = ? WHERE discord_id = ?",
-        args: [pending.roblox_id, pending.roblox_username, interaction.user.id],
-      });
-      await interaction.reply({
-        content: `Your linked Roblox account has been updated to **${pending.roblox_username}**.`,
-        ...ephemeralReply,
-      });
-    } else {
-      await db.execute({
-        sql: `INSERT INTO accounts (discord_id, roblox_id, roblox_username, balance, frozen)
-          VALUES (?, ?, ?, 0, 0)`,
-        args: [interaction.user.id, pending.roblox_id, pending.roblox_username],
-      });
-      await interaction.reply({
-        content: `Your Roblox account **${pending.roblox_username}** is now linked to PTB.`,
-        ...ephemeralReply,
-      });
-    }
-  } catch (error) {
-    await transaction.rollback().catch(() => {});
-    throw error;
-  } finally {
-    transaction.close();
-  }
-}
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-client.once(Events.ClientReady, (readyClient) => {
+client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
+  if (!registrationConfig.ok) return;
+  try {
+    const guild = await readyClient.guilds.fetch(process.env.GUILD_ID);
+    await guild.roles.fetch();
+    const botMember = await guild.members.fetchMe();
+    const readiness = validateRoleAssignmentAccess({
+      hasManageRoles: botMember.permissions.has(PermissionFlagsBits.ManageRoles),
+      botHighestPosition: botMember.roles.highest.position,
+      verifiedRole: guild.roles.cache.get(process.env.BLOXLINK_VERIFIED_ROLE_ID),
+      registeredRole: guild.roles.cache.get(process.env.REGISTERED_ROLE_ID),
+    });
+    if (!readiness.ok) {
+      console.error("[PTB Config] Registration disabled due to Discord role configuration:", readiness.problems.join("; "));
+      return;
+    }
+    registrationRolesReady = true;
+    console.log("[PTB Config] Registration role permissions and hierarchy verified.");
+  } catch (error) {
+    console.error("[PTB Config] Could not verify registration roles; registration remains disabled.", error?.message ?? "unknown error");
+  }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -795,61 +484,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    if (interaction.customId === "verify_with_roblox") {
-      try {
-        await handleRegister(interaction);
-      } catch (error) {
-        console.error("Roblox verification button failed:", error);
-        await interaction.reply({
-          content: "I could not start verification right now. Please try again shortly.",
-          ...ephemeralReply,
-        }).catch((replyError) => console.error("Could not send verification error reply:", replyError));
-      }
-      return;
-    }
-
-    if (interaction.customId === "change_roblox_account") {
-      try {
-        await startOAuthFlow(interaction, true);
-      } catch (error) {
-        console.error("Change Roblox account button failed:", error);
-        const reply = {
-          content: "I could not start account change right now. Please try again shortly.",
-          components: [],
-        };
-        if (interaction.replied || interaction.deferred) {
-          await interaction.followUp({ ...reply, ...ephemeralReply }).catch(() => {});
-        } else {
-          await interaction.update(reply).catch(() => {});
-        }
-      }
-      return;
-    }
-
-    if (interaction.customId === "cancel_change_account") {
-      try {
-        await interaction.update({
-          content: "Account change cancelled.",
-          components: [],
-        });
-      } catch (error) {
-        console.error("Cancel change account button failed:", error);
-      }
-      return;
-    }
-
-    if (interaction.customId.startsWith("confirm_link_")) {
-      const pendingId = interaction.customId.slice("confirm_link_".length);
-      try {
-        await handleConfirmLink(interaction, pendingId);
-      } catch (error) {
-        console.error("Confirm link failed:", error);
-        await interaction.reply({
-          content: "I could not complete that request right now. Please try again shortly.",
-          ...ephemeralReply,
-        }).catch((replyError) => console.error("Could not send confirm error reply:", replyError));
-      }
-      return;
+    try {
+      await interaction.reply({
+        content: "That button is no longer available.",
+        ...ephemeralReply,
+      });
+    } catch (replyError) {
+      console.error("Could not acknowledge an unknown PTB button:", replyError);
     }
     return;
   }

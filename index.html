@@ -107,8 +107,8 @@
         <div class="val"><span class="badge badge-success">● SQLite / Turso Ready</span></div>
       </div>
       <div class="card">
-        <h3>Roblox OAuth</h3>
-        <div class="val"><span class="badge badge-neutral">PKCE Callback Ready</span></div>
+        <h3>Bloxlink Verification</h3>
+        <div class="val"><span class="badge badge-neutral">Guild API Integration</span></div>
       </div>
       <div class="card">
         <h3>Discord Gateway</h3>
@@ -129,8 +129,8 @@
         <tbody>
           <tr><td><code>/ping</code></td><td>Utility</td><td>Check if the bot is responding</td></tr>
           <tr><td><code>/help</code></td><td>Utility</td><td>Interactive command guide filtered by permission</td></tr>
-          <tr><td><code>/register</code></td><td>Account</td><td>Link Roblox account using OAuth PKCE</td></tr>
-          <tr><td><code>/verify</code></td><td>Account</td><td>Check or update linked Roblox account</td></tr>
+          <tr><td><code>/register</code></td><td>Account</td><td>Register after Bloxlink verification</td></tr>
+          <tr><td><code>/verify</code></td><td>Account</td><td>Check your PTB link or learn how to register through Bloxlink</td></tr>
           <tr><td><code>/balance</code></td><td>Ledger</td><td>Privately inspect your PTB ledger balance</td></tr>
           <tr><td><code>/transaction history</code></td><td>Ledger</td><td>Paginated statement of ledger transactions</td></tr>
           <tr><td><code>/deposit [amount]</code></td><td>Tickets</td><td>Open private deposit ticket with admin approval</td></tr>
@@ -143,11 +143,10 @@
       </table>
     </div>
 
-    <h2 class="section-title">API &amp; Callback Endpoints</h2>
+    <h2 class="section-title">API Endpoints</h2>
     <div class="card">
       <ul style="list-style: none; display: flex; flex-direction: column; gap: 0.75rem;">
         <li><strong>Health Check:</strong> <code>GET /health</code> &mdash; Returns HTTP 200 <code>ok</code>.</li>
-        <li><strong>Roblox OAuth Callback:</strong> <code>GET /oauth/roblox/callback</code> &mdash; Secure OAuth 2.0 PKCE redirection endpoint.</li>
       </ul>
     </div>
 
