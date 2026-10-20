@@ -33,191 +33,13 @@ if (missingEnv.length) {
 const port = Number(process.env.PORT || 3000);
 
 let ready = false;
-let dbConnected = false;
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-function renderDashboardHtml() {
-  const discordStatus = client.isReady()
-    ? `<span class="badge badge-success">● Connected (${escapeHtml(client.user?.tag ?? "Online")})</span>`
-    : (process.env.DISCORD_TOKEN
-      ? `<span class="badge badge-warning">● Connecting / Standby</span>`
-      : `<span class="badge badge-neutral">○ Standby (Configure DISCORD_TOKEN)</span>`);
-
-  const dbStatus = dbConnected
-    ? (process.env.TURSO_URL
-      ? `<span class="badge badge-success">● Turso Cloud DB</span>`
-      : `<span class="badge badge-success">● Local SQLite (ptb-local.db)</span>`)
-    : `<span class="badge badge-warning">● Initializing</span>`;
-
-  const robloxStatus = process.env.BLOXLINK_API_KEY
-    ? `<span class="badge badge-success">● Bloxlink API Active</span>`
-    : `<span class="badge badge-neutral">○ Standby (Configure Bloxlink API)</span>`;
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pacific Trust Bank | Discord Ledger</title>
-  <style>
-    :root {
-      --bg: #0b1319;
-      --surface: #111e27;
-      --surface-border: #1e3342;
-      --primary: #10b981;
-      --primary-dark: #059669;
-      --text: #e2e8f0;
-      --text-muted: #94a3b8;
-      --accent: #38bdf8;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      line-height: 1.6;
-      padding: 2rem 1rem;
-    }
-    .container { max-width: 960px; margin: 0 auto; }
-    header {
-      border-bottom: 1px solid var(--surface-border);
-      padding-bottom: 1.5rem;
-      margin-bottom: 2rem;
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 1rem;
-    }
-    .logo-group h1 { font-size: 1.75rem; font-weight: 700; color: #fff; letter-spacing: -0.02em; }
-    .logo-group p { color: var(--text-muted); font-size: 0.95rem; }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.4rem;
-      padding: 0.3rem 0.75rem;
-      border-radius: 9999px;
-      font-size: 0.8rem;
-      font-weight: 600;
-    }
-    .badge-success { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
-    .badge-warning { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
-    .badge-neutral { background: rgba(148, 163, 184, 0.15); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.3); }
-    .status-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 1rem;
-      margin-bottom: 2rem;
-    }
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--surface-border);
-      border-radius: 8px;
-      padding: 1.25rem;
-    }
-    .card h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 0.5rem; }
-    .card .val { font-size: 1.05rem; font-weight: 600; color: #fff; }
-    .section-title { font-size: 1.2rem; font-weight: 600; color: #fff; margin: 2rem 0 1rem; }
-    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.9rem; }
-    th, td { text-align: left; padding: 0.75rem 1rem; border-bottom: 1px solid var(--surface-border); }
-    th { background: rgba(0,0,0,0.2); color: var(--text-muted); font-weight: 600; }
-    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background: rgba(255,255,255,0.08); padding: 0.15rem 0.4rem; border-radius: 4px; color: var(--accent); }
-    .footer { text-align: center; margin-top: 3rem; color: var(--text-muted); font-size: 0.85rem; border-top: 1px solid var(--surface-border); padding-top: 1.5rem; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <div class="logo-group">
-        <h1>🏦 Pacific Trust Bank</h1>
-        <p>Roleplay Ledger & Discord Bot for Emergency Hamburg RP</p>
-      </div>
-      <div>
-        <span class="badge ${ready ? "badge-success" : "badge-warning"}">${ready ? "● Operational" : "○ Initializing"}</span>
-      </div>
-    </header>
-
-    <div class="status-grid">
-      <div class="card">
-        <h3>Discord Gateway</h3>
-        <div class="val">${discordStatus}</div>
-      </div>
-      <div class="card">
-        <h3>Database Storage</h3>
-        <div class="val">${dbStatus}</div>
-      </div>
-      <div class="card">
-        <h3>Roblox Verification</h3>
-        <div class="val">${robloxStatus}</div>
-      </div>
-      <div class="card">
-        <h3>HTTP Port</h3>
-        <div class="val"><code>0.0.0.0:${port}</code></div>
-      </div>
-    </div>
-
-    <h2 class="section-title">Available Slash Commands</h2>
-    <div class="card" style="padding: 0; overflow-x: auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Command</th>
-            <th>Type</th>
-            <th>Description</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr><td><code>/ping</code></td><td>General</td><td>Check if the bot is responding</td></tr>
-          <tr><td><code>/help</code></td><td>General</td><td>Interactive command guide filtered by permission</td></tr>
-          <tr><td><code>/register</code></td><td>Account</td><td>Register after Bloxlink verification</td></tr>
-          <tr><td><code>/verify</code></td><td>Account</td><td>Check your PTB link or learn how to register through Bloxlink</td></tr>
-          <tr><td><code>/balance</code></td><td>Account</td><td>Privately inspect your PTB ledger balance</td></tr>
-          <tr><td><code>/transaction history</code></td><td>Account</td><td>Paginated statement of deposits, withdrawals, transfers</td></tr>
-          <tr><td><code>/deposit [amount]</code></td><td>Tickets</td><td>Open a private deposit channel with admin approval</td></tr>
-          <tr><td><code>/withdraw [amount]</code></td><td>Tickets</td><td>Open a private withdrawal channel with anti-overdraw payout</td></tr>
-          <tr><td><code>/transfer [user] [amt]</code></td><td>Ledger</td><td>Transfer funds atomically with replay prevention</td></tr>
-          <tr><td><code>/add-balance [user] [amt]</code></td><td>Admin</td><td>Admin command to credit an account directly</td></tr>
-          <tr><td><code>/bill [list|settle]</code></td><td>Recurring</td><td>View or settle due recurring bills</td></tr>
-          <tr><td><code>/tax [list|settle]</code></td><td>Recurring</td><td>View or settle due recurring city taxes</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h2 class="section-title">Endpoints & Integration</h2>
-    <div class="card">
-      <ul style="list-style: none; display: flex; flex-direction: column; gap: 0.75rem;">
-        <li><strong>Health Check:</strong> <code>GET /health</code> &mdash; Returns HTTP 200 <code>ok</code> when the ledger is ready.</li>
-      </ul>
-    </div>
-
-    <div class="footer">
-      Pacific Trust Bank &bull; Roleplay ledger system &bull; Emergency Hamburg RP
-    </div>
-  </div>
-</body>
-</html>`;
-}
 
 const healthServer = createServer((request, response) => {
   try {
     const requestUrl = new URL(request.url ?? "/", "http://localhost");
-    if (requestUrl.pathname === "/health") {
+    if (requestUrl.pathname === "/health" || requestUrl.pathname === "/") {
       response.writeHead(ready ? 200 : 503, { "content-type": "text/plain; charset=utf-8" });
       response.end(ready ? "ok" : "starting");
-      return;
-    }
-
-    if (requestUrl.pathname === "/" || requestUrl.pathname === "/index.html") {
-      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      response.end(renderDashboardHtml());
       return;
     }
 
@@ -225,7 +47,7 @@ const healthServer = createServer((request, response) => {
     response.end("not found");
   } catch (error) {
     // A request-handler throw must never take the health server (or the bot) down.
-    console.error("PTB dashboard request failed:", error);
+    console.error("PTB health server request failed:", error);
     if (!response.headersSent) {
       response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
     }
@@ -539,7 +361,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 try {
   await db.batch([...schemaStatements, ...ticketSchemaStatements, ...recurringChargeSchemaStatements], "write");
-  dbConnected = true;
   console.log("PTB ledger database initialized successfully.");
 
   const hasDiscordConfig = Boolean(
