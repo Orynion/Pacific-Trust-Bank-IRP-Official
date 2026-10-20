@@ -17,7 +17,14 @@ import {
 } from "discord.js";
 import { getTransactionHistory, handleHistoryButton } from "./transaction-history.js";
 import { handleBillCommand, processDueCharges, recurringChargeSchemaStatements, sendDueChargeReminders } from "./recurring-charges.js";
-import { isAllowedCallbackHost, buildTokenRequestBody } from "./oauth-security.js";
+import {
+  isAllowedCallbackHost,
+  buildTokenRequestBody,
+  buildRobloxAuthorizationUrl,
+  checkRobloxOAuthConfigAtStartup,
+  getRobloxOAuthCredentials,
+  validateRobloxOAuthConfig,
+} from "./oauth-security.js";
 import {
   ephemeralReply,
   handleAddBalance,
@@ -45,6 +52,9 @@ if (missingEnv.length > 0) {
   console.warn(`[PTB Info] Missing environment variables: ${missingEnv.join(", ")}`);
   console.warn("[PTB Info] Running with local SQLite fallback. Set DISCORD_TOKEN, CLIENT_ID, GUILD_ID in .env to connect Discord.");
 }
+
+// Check Roblox OAuth configuration on startup without exposing secrets
+checkRobloxOAuthConfigAtStartup(process.env);
 
 const port = 3000;
 
@@ -427,15 +437,16 @@ async function handleVerify(interaction) {
   });
 }
 
-const oauthConfigured = () => Boolean(
-  process.env.ROBLOX_CLIENT_ID &&
-  process.env.ROBLOX_CLIENT_SECRET &&
-  process.env.ROBLOX_REDIRECT_URI,
-);
+const oauthConfigured = () => validateRobloxOAuthConfig().ok;
 
 async function startOAuthFlow(interaction, isChange = false) {
-  if (!oauthConfigured()) {
-    const content = "Roblox OAuth is not configured yet. The PTB administrator must add the Roblox OAuth app settings before accounts can be linked.";
+  const config = validateRobloxOAuthConfig();
+  if (!config.ok) {
+    let missingHint = "";
+    if (!config.hasClientId) {
+      missingHint = " (ROBLOX_CLIENT_ID is missing or invalid)";
+    }
+    const content = `Roblox OAuth is not configured yet${missingHint}. The PTB administrator must configure Roblox OAuth app settings before accounts can be linked.`;
     if (interaction.isButton() && interaction.customId === "change_roblox_account") {
       await interaction.update({ content, components: [] });
     } else if (!interaction.replied && !interaction.deferred) {
@@ -468,19 +479,30 @@ async function startOAuthFlow(interaction, isChange = false) {
     },
   ], "write");
 
-  const authorizeUrl = new URL("https://apis.roblox.com/oauth/v1/authorize");
-  authorizeUrl.search = new URLSearchParams({
-    client_id: process.env.ROBLOX_CLIENT_ID,
-    redirect_uri: process.env.ROBLOX_REDIRECT_URI,
-    scope: "openid profile",
-    response_type: "code",
-    state,
-    code_challenge: codeChallenge,
-    code_challenge_method: "S256",
-  }).toString();
+  let authorizeUrl;
+  try {
+    authorizeUrl = buildRobloxAuthorizationUrl({
+      clientId: config.clientId,
+      redirectUri: config.redirectUri,
+      state,
+      codeChallenge,
+      scopes: "openid profile",
+    });
+  } catch (urlError) {
+    console.error("Roblox authorization URL generation failed:", urlError.message);
+    const content = "Could not generate Roblox authorization URL due to invalid client configuration. Please contact a PTB administrator.";
+    if (interaction.isButton() && interaction.customId === "change_roblox_account") {
+      await interaction.update({ content, components: [] });
+    } else if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content, ...ephemeralReply });
+    } else {
+      await interaction.followUp({ content, ...ephemeralReply });
+    }
+    return;
+  }
 
   const actionText = isChange ? "link a different Roblox account" : "link your Roblox account";
-  const content = `Authorize PTB to ${actionText}: ${authorizeUrl.toString()}\nThis link expires in 10 minutes.`;
+  const content = `Authorize PTB to ${actionText}: ${authorizeUrl}\nThis link expires in 10 minutes.`;
 
   if (interaction.isButton() && interaction.customId === "change_roblox_account") {
     await interaction.update({ content, components: [] });
@@ -563,8 +585,9 @@ async function handleRobloxOAuthCallback(request, response) {
     // address (the redirect URI). Requests arriving with an attacker-chosen
     // Host header (rogue domains parked at this address, DNS rebinding, port
     // confusion) are refused before any OAuth state is consumed.
+    const credentials = getRobloxOAuthCredentials();
     const hostHeader = request.headers.host ?? "";
-    if (!isAllowedCallbackHost(`http://${hostHeader}`, process.env.ROBLOX_REDIRECT_URI)) {
+    if (!isAllowedCallbackHost(`http://${hostHeader}`, credentials.redirectUri)) {
       sendOAuthResult(response, 400, "This PTB link page must be opened through its registered address. Return to Discord and run /register again.");
       return;
     }
@@ -594,7 +617,7 @@ async function handleRobloxOAuthCallback(request, response) {
 
     // redirect_uri is required here per RFC 6749 §4.1.3 because the
     // authorization request included it; it must match the registered value.
-    const tokenBody = buildTokenRequestBody(code, session.code_verifier, process.env.ROBLOX_REDIRECT_URI);
+    const tokenBody = buildTokenRequestBody(code, session.code_verifier, credentials.redirectUri, credentials.clientId, credentials.clientSecret);
     const tokens = await requestOAuthJson("https://apis.roblox.com/oauth/v1/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
