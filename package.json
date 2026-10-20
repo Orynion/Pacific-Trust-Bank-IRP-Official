@@ -1,0 +1,19 @@
+{
+  "name": "ptb-discord-ledger-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "PTB roleplay bank ledger bot for Discord",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test src/bank-logic.test.js src/transaction-history.test.js src/ticket-ops.test.js"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0",
+    "discord.js": "^14.27.0",
+    "dotenv": "^16.6.1"
+  }
+}
