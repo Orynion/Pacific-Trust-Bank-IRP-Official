@@ -74,6 +74,22 @@ export async function registerVerifiedIdentity(db, discordId, identity) {
     });
     if (byDiscord.rows.length) {
       const account = byDiscord.rows[0];
+      if (!account.roblox_id) {
+        const byRoblox = await transaction.execute({
+          sql: "SELECT discord_id FROM accounts WHERE roblox_id = ? LIMIT 1",
+          args: [identity.robloxId],
+        });
+        if (byRoblox.rows.length) {
+          await transaction.commit();
+          return { status: "roblox_conflict", account: byRoblox.rows[0] };
+        }
+        await transaction.execute({
+          sql: "UPDATE accounts SET roblox_id = ?, roblox_username = ? WHERE discord_id = ? AND roblox_id IS NULL",
+          args: [identity.robloxId, identity.robloxUsername, discordId],
+        });
+        await transaction.commit();
+        return { status: "registered", account: { ...account, ...identity } };
+      }
       await transaction.commit();
       return account.roblox_id === identity.robloxId
         ? { status: "existing_same", account }

@@ -80,6 +80,10 @@ const registerCommand = new SlashCommandBuilder()
   .setName("register")
   .setDescription("Register your Roblox account with PTB through Bloxlink verification.");
 
+const unregisterCommand = new SlashCommandBuilder()
+  .setName("unregister")
+  .setDescription("Disconnect your Roblox account from PTB while keeping your ledger account.");
+
 const balanceCommand = new SlashCommandBuilder()
   .setName("balance")
   .setDescription("Check your own PTB account balance.");
@@ -164,6 +168,7 @@ function createHelpEmbed(isAdministrator) {
         name: "Account",
         value: [
           "`/register` — Check Bloxlink and register your linked Roblox account. PTB also registers automatically after Bloxlink verification.\nExample: `/register`",
+          "`/unregister` — Disconnect your Roblox identity while keeping your PTB balance and transaction history.\nExample: `/unregister`",
           "`/balance` — Privately check your own PTB balance.\nExample: `/balance`",
           "`/bill list` and `/tax list` — View recurring bills and taxes separately. Use `/bill settle` or `/tax settle` to settle due charges of that type.",
         ].join("\n\n"),
@@ -208,10 +213,10 @@ async function handleRegister(interaction) {
   await interaction.deferReply(ephemeralReply);
 
   const accountResult = await db.execute({
-    sql: "SELECT roblox_username FROM accounts WHERE discord_id = ? LIMIT 1",
+    sql: "SELECT roblox_id, roblox_username FROM accounts WHERE discord_id = ? LIMIT 1",
     args: [interaction.user.id],
   });
-  if (accountResult.rows.length) {
+  if (accountResult.rows[0]?.roblox_id) {
     await interaction.editReply(`Your PTB account is linked to **${accountResult.rows[0].roblox_username || "a Roblox account"}**.`);
     return;
   }
@@ -242,7 +247,7 @@ async function handleRegister(interaction) {
   const result = await handleGuildMemberUpdate.processVerifiedMember(member, { notify: false });
   if (result?.status === "registered" || result?.status === "existing_same") {
     const registeredAccount = await db.execute({
-      sql: "SELECT roblox_username FROM accounts WHERE discord_id = ? LIMIT 1",
+      sql: "SELECT roblox_id, roblox_username FROM accounts WHERE discord_id = ? LIMIT 1",
       args: [interaction.user.id],
     });
     const username = registeredAccount.rows[0]?.roblox_username;
@@ -268,6 +273,33 @@ async function handleRegister(interaction) {
     await interaction.editReply("PTB registration only works inside the PTB Discord server. Run `/register` there (the server where you verified with Bloxlink).");
   }
 }
+async function handleUnregister(interaction) {
+  await interaction.deferReply(ephemeralReply);
+  const result = await db.execute({
+    sql: "UPDATE accounts SET roblox_id = NULL, roblox_username = NULL WHERE discord_id = ? AND roblox_id IS NOT NULL",
+    args: [interaction.user.id],
+  });
+  if (Number(result.rowsAffected ?? 0) === 0) {
+    await interaction.editReply("Your PTB account does not currently have a Roblox account linked.");
+    return;
+  }
+
+  let roleNote = "";
+  if (interaction.guild && process.env.REGISTERED_ROLE_ID) {
+    try {
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      if (member.roles.cache.has(process.env.REGISTERED_ROLE_ID)) {
+        await member.roles.remove(process.env.REGISTERED_ROLE_ID, "User disconnected their Roblox account from PTB");
+      }
+    } catch (error) {
+      console.error("PTB could not remove Registered role after unlink:", error);
+      roleNote = " I could not remove your Registered role, so please contact a server administrator.";
+    }
+  }
+
+  await interaction.editReply(`Your Roblox account has been disconnected from PTB. Your PTB balance and transaction history were kept. Run /register to link an account again.${roleNote}`);
+}
+
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 const registrationConfig = validateRegistrationConfig(process.env);
 if (!registrationConfig.ok) console.error(`[PTB Config] Registration unavailable; set valid guild, role IDs, and Bloxlink API key: ${registrationConfig.missing.join(", ")}`);
@@ -382,6 +414,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply("pong");
     } else if (interaction.commandName === "register") {
       await handleRegister(interaction);
+    } else if (interaction.commandName === "unregister") {
+      await handleUnregister(interaction);
     } else if (interaction.commandName === "balance") {
       await handleBalance(db, interaction);
     } else if (interaction.commandName === "transaction" && interaction.options.getSubcommand() === "history") {
@@ -435,6 +469,7 @@ try {
             helpCommand.toJSON(),
             pingCommand.toJSON(),
             registerCommand.toJSON(),
+            unregisterCommand.toJSON(),
             balanceCommand.toJSON(),
             transactionCommand.toJSON(),
             depositCommand.toJSON(),
