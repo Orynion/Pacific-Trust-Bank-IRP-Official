@@ -252,6 +252,13 @@ async function handleRegister(interaction) {
     });
     const username = registeredAccount.rows[0]?.roblox_username;
     await interaction.editReply(username ? `Your Roblox account **${username}** is registered with PTB.` : "Your account is registered with PTB.");
+    try {
+      await interaction.user.send(username
+        ? `Your Roblox account **${username}** is now registered with PTB.`
+        : "Your account is now registered with PTB.");
+    } catch (error) {
+      console.warn("PTB could not send registration DM:", error?.message ?? "unknown error");
+    }
   } else if (result?.status === "roblox_conflict") {
     await interaction.editReply("That Roblox account is already linked to another PTB account. Contact a PTB administrator if you think this is a mistake.");
   } else if (result?.status === "discord_conflict") {
@@ -280,7 +287,7 @@ async function handleUnregister(interaction) {
     args: [interaction.user.id],
   });
   if (Number(result.rowsAffected ?? 0) === 0) {
-    await interaction.editReply("Your PTB account does not currently have a Roblox account linked.");
+    await interaction.editReply("No account is linked.");
     return;
   }
 
@@ -408,6 +415,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (interaction.commandName !== "register" && interaction.commandName !== "unregister") {
+      const accountResult = await db.execute({
+        sql: "SELECT 1 FROM accounts WHERE discord_id = ? AND roblox_id IS NOT NULL LIMIT 1",
+        args: [interaction.user.id],
+      });
+      if (!accountResult.rows.length) {
+        await interaction.reply({
+          content: "You need to run `/register` before using PTB commands.",
+          ...ephemeralReply,
+        });
+        return;
+      }
+    }
+
     if (interaction.commandName === "help") {
       await handleHelp(interaction);
     } else if (interaction.commandName === "ping") {
