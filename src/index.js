@@ -202,25 +202,43 @@ async function handleTransactionHistory(interaction) {
 }
 
 async function handleRegister(interaction) {
+  // Acknowledge the interaction before any network call (DB, member fetch,
+  // Bloxlink) so slow lookups can never turn into "The application did not
+  // respond", which would leave users stuck in an unusable registration loop.
+  await interaction.deferReply(ephemeralReply);
+
   const accountResult = await db.execute({
     sql: "SELECT roblox_username FROM accounts WHERE discord_id = ? LIMIT 1",
     args: [interaction.user.id],
   });
   if (accountResult.rows.length) {
-    await interaction.reply({ content: `Your PTB account is linked to **${accountResult.rows[0].roblox_username || "a Roblox account"}**.`, ...ephemeralReply });
+    await interaction.editReply(`Your PTB account is linked to **${accountResult.rows[0].roblox_username || "a Roblox account"}**.`);
     return;
   }
   if (!registrationConfig.ok) {
-    await interaction.reply({ content: "PTB account registration is not configured yet. Please contact a PTB administrator.", ...ephemeralReply });
+    await interaction.editReply(
+      `PTB registration is not configured yet, so /register cannot set up your account. A PTB administrator must add these settings and restart the bot: ${registrationConfig.missing.join(", ")}.`,
+    );
     return;
   }
-  const member = await interaction.guild?.members.fetch(interaction.user.id);
-  if (!member) {
-    await interaction.reply({ content: "Run `/register` in the configured Discord server so PTB can check your Bloxlink link.", ...ephemeralReply });
+  if (!registrationRolesReady) {
+    await interaction.editReply("PTB registration is not ready: the Bloxlink and Registered roles could not be verified at startup (permissions or role position). Wait a minute and try /register again; if it still fails, a PTB administrator must fix the bot's Discord roles.");
     return;
   }
 
-  await interaction.deferReply(ephemeralReply);
+  let member;
+  if (interaction.guild) {
+    try {
+      member = await interaction.guild.members.fetch(interaction.user.id);
+    } catch {
+      member = undefined;
+    }
+  }
+  if (!member) {
+    await interaction.editReply("Run `/register` in the PTB Discord server so PTB can check your Bloxlink link.");
+    return;
+  }
+
   const result = await handleGuildMemberUpdate.processVerifiedMember(member, { notify: false });
   if (result?.status === "registered" || result?.status === "existing_same") {
     const registeredAccount = await db.execute({
@@ -231,6 +249,10 @@ async function handleRegister(interaction) {
     await interaction.editReply(username ? `Your Roblox account **${username}** is registered with PTB.` : "Your account is registered with PTB.");
   } else if (result?.status === "roblox_conflict") {
     await interaction.editReply("That Roblox account is already linked to another PTB account. Contact a PTB administrator if you think this is a mistake.");
+  } else if (result?.status === "discord_conflict") {
+    await interaction.editReply("Your Discord account already has a PTB account linked to a different Roblox identity. PTB has not changed that link. Contact a PTB administrator if you think this is a mistake.");
+  } else if (result?.status === "conflict") {
+    await interaction.editReply("PTB could not safely confirm your account link because another registration completed at the same time. Please contact a PTB administrator.");
   } else if (result?.status === "error" && /HTTP 404|did not return a verified Roblox ID/.test(result.error?.message ?? "")) {
     await interaction.editReply({
       content: "Bloxlink has not linked a Roblox account to you yet. Click **Verify with Bloxlink** below. After Bloxlink finishes, PTB will detect the link and register your account automatically.",
@@ -238,8 +260,12 @@ async function handleRegister(interaction) {
         new ButtonBuilder().setLabel("Verify with Bloxlink").setStyle(ButtonStyle.Link).setURL(BLOXLINK_VERIFY_URL),
       )],
     });
+  } else if (result?.status === "error") {
+    await interaction.editReply("PTB could not complete registration right now (Bloxlink lookup or role assignment failed). Your Bloxlink verification is unchanged; please try again in a little while or contact a PTB administrator.");
   } else {
-    await interaction.editReply("PTB could not complete registration. Your Bloxlink verification is unchanged; please try again later or contact a PTB administrator.");
+    // result is undefined only when registration is disabled for this request's
+    // guild (for example /register used outside PTB's configured server).
+    await interaction.editReply("PTB registration only works inside the PTB Discord server. Run `/register` there (the server where you verified with Bloxlink).");
   }
 }
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });

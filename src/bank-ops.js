@@ -11,6 +11,11 @@ export const MAX_BALANCE = 2_147_483_647;
 
 export const ephemeralReply = { flags: MessageFlags.Ephemeral };
 
+/** Single source of truth for the "you are not registered" guidance, so every command
+ *  prints exactly one identical /register instruction instead of drifting variants. */
+export const REGISTER_FIRST_MESSAGE =
+  "You do not have a registered PTB account yet. Run /register to link your Roblox account first.";
+
 export const schemaStatements = [
   // Retire abandoned, short-lived state from the removed Roblox OAuth flow.
   `DROP TABLE IF EXISTS oauth_sessions`,
@@ -72,7 +77,7 @@ export async function handleMoneyRequest(db, interaction, type) {
     args: [interaction.user.id],
   });
   if (accountResult.rows.length === 0) {
-    await interaction.editReply("You need a registered PTB account before opening a money request. Run /register first.");
+    await interaction.editReply(REGISTER_FIRST_MESSAGE);
     return;
   }
 
@@ -230,7 +235,7 @@ export async function handleBalance(db, interaction) {
 
   if (accountResult.rows.length === 0) {
     await interaction.reply({
-      content: "You do not have a registered PTB account yet. Run /register to link your Roblox account.",
+      content: REGISTER_FIRST_MESSAGE,
       ...ephemeralReply,
     });
     return;
@@ -315,7 +320,7 @@ export async function handleTransfer(db, interaction) {
     if (senderResult.rows.length === 0) {
       await transaction.rollback();
       await interaction.reply({
-        content: "You do not have a registered PTB account. Link your account with /register first.",
+        content: REGISTER_FIRST_MESSAGE,
         ...ephemeralReply,
       });
       return;

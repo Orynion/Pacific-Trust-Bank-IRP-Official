@@ -265,7 +265,7 @@ test("case 1: transfers from unregistered senders are rejected", async () => {
     const { interaction, result } = runTransfer(db, { senderId, targetId, amount: 10, id: "770000000000000001" });
     await result;
 
-    assert.match(interaction.state.replies[0].content, /do not have a registered PTB account\. Link your account with \/register first\./);
+    assert.match(interaction.state.replies[0].content, /do not have a registered PTB account yet\. Run \/register to link your Roblox account first\./);
     assert.equal(await getBalance(db, senderId), null);
     assert.equal(await getBalance(db, targetId), 50);
     assert.equal((await getLedger(db)).length, 0);
