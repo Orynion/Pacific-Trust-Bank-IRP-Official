@@ -1,4 +1,4 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, MessageFlags, PermissionFlagsBits } from "discord.js";
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, EmbedBuilder, MessageFlags, PermissionFlagsBits } from "discord.js";
 import {
   attachTicketChannel,
   createPendingTicket,
@@ -243,7 +243,11 @@ export async function handleBalance(db, interaction) {
 
   const balance = Number(accountResult.rows[0].balance);
   await interaction.reply({
-    content: `Your current PTB balance is ${balance.toLocaleString()}.`,
+    embeds: [new EmbedBuilder()
+      .setColor(0x0B3D2E)
+      .setTitle("Pacific Trust Bank | Account Balance")
+      .setDescription(`**${balance.toLocaleString()}**`)
+      .setFooter({ text: "Private ledger balance · Roleplay only" })],
     ...ephemeralReply,
   });
 }

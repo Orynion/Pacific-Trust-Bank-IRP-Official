@@ -1,4 +1,4 @@
-import { MessageFlags, PermissionFlagsBits } from "discord.js";
+import { EmbedBuilder, MessageFlags, PermissionFlagsBits } from "discord.js";
 
 export const recurringChargeSchemaStatements = [
   `CREATE TABLE IF NOT EXISTS recurring_charges (
@@ -23,6 +23,11 @@ export const recurringChargeSchemaStatements = [
 ];
 
 const ephemeral = { flags: MessageFlags.Ephemeral };
+const chargeColor = 0x0B3D2E;
+function chargeEmbed(title, description, color = chargeColor) {
+  return new EmbedBuilder().setColor(color).setTitle(title).setDescription(description)
+    .setFooter({ text: "Pacific Trust Bank · Roleplay ledger only" });
+}
 const addInterval = (date, interval) => {
   const next = new Date(date);
   if (interval === "daily") next.setUTCDate(next.getUTCDate() + 1);
@@ -31,11 +36,11 @@ const addInterval = (date, interval) => {
   return next.toISOString();
 };
 
-async function sendUserNotice(client, userId, message) {
+async function sendUserNotice(client, userId, payload) {
   if (!client) return;
   try {
     const user = await client.users.fetch(userId);
-    await user.send(message);
+    await user.send(payload);
   } catch (error) {
     console.warn(`Could not send PTB bill notification to ${userId}:`, error?.message ?? error);
   }
@@ -58,8 +63,9 @@ export async function sendDueChargeReminders(db, client, now = new Date()) {
     });
     if (claimed.rowsAffected !== 1) continue;
     const timestamp = Math.floor(new Date(charge.next_due_at).getTime() / 1000);
-    await sendUserNotice(client, charge.discord_id,
-      `PTB reminder: your ${charge.kind} **${charge.name}** for ${Number(charge.amount).toLocaleString()} is due <t:${timestamp}:R>. It will be deducted automatically from your PTB ledger balance.`);
+    await sendUserNotice(client, charge.discord_id, {
+      embeds: [chargeEmbed(`${charge.kind === "tax" ? "Tax" : "Bill"} due soon`, `**${charge.name}**\nAmount: **${Number(charge.amount).toLocaleString()}**\nDue <t:${timestamp}:R>. It will be deducted automatically from your PTB ledger balance.`)],
+    });
   }
   return due.rows.length;
 }
@@ -79,7 +85,7 @@ export async function handleBillCommand(db, interaction, kind) {
       });
       if (replay.rows.length) {
         await tx.rollback();
-        await interaction.reply({ content: "This settlement was already processed.", ...ephemeral });
+      await interaction.reply({ embeds: [chargeEmbed("Already processed", "This settlement was already processed.", 0xD97706)], ...ephemeral });
         return;
       }
       const chargeResult = await tx.execute({
@@ -89,7 +95,7 @@ export async function handleBillCommand(db, interaction, kind) {
       const charges = chargeResult.rows;
       if (!charges.length) {
         await tx.rollback();
-        await interaction.reply({ content: `There are no ${kind === "tax" ? "taxes" : "bills"} currently due to settle.`, ...ephemeral });
+        await interaction.reply({ embeds: [chargeEmbed(`No ${kind === "tax" ? "taxes" : "bills"} due`, `There are no ${kind === "tax" ? "taxes" : "bills"} currently due to settle.`)], ...ephemeral });
         return;
       }
       const total = charges.reduce((sum, charge) => sum + Number(charge.amount), 0);
@@ -97,7 +103,7 @@ export async function handleBillCommand(db, interaction, kind) {
       const balance = Number(account.rows[0]?.balance ?? 0);
       if (!Number.isSafeInteger(total) || Number(account.rows[0]?.frozen) === 1 || balance < total) {
         await tx.rollback();
-        await interaction.reply({ content: `Insufficient funds. Nothing was deducted. Available balance: ${balance.toLocaleString()}; total due for ${kind === "tax" ? "taxes" : "bills"}: ${total.toLocaleString()}. Your recurring schedules were not changed.`, ...ephemeral });
+        await interaction.reply({ embeds: [chargeEmbed("Settlement not completed", `Insufficient funds. Nothing was deducted.\nAvailable balance: **${balance.toLocaleString()}**\nTotal due: **${total.toLocaleString()}**\nYour recurring schedules were not changed.`, 0xD97706)], ...ephemeral });
         return;
       }
       const debit = await tx.execute({
@@ -106,7 +112,7 @@ export async function handleBillCommand(db, interaction, kind) {
       });
       if (debit.rowsAffected !== 1) {
         await tx.rollback();
-        await interaction.reply({ content: "This charge could not be settled because the account balance changed. Please try again.", ...ephemeral });
+        await interaction.reply({ embeds: [chargeEmbed("Settlement not completed", "The account balance changed before settlement. Please try again.", 0xD97706)], ...ephemeral });
         return;
       }
       for (const charge of charges) {
@@ -131,10 +137,11 @@ export async function handleBillCommand(db, interaction, kind) {
       });
       await tx.commit();
       const who = accountId === interaction.user.id ? "you" : `<@${accountId}>`;
-      await interaction.reply({ content: `Settled ${charges.length} ${kind === "tax" ? "tax(es)" : "bill(s)"} for ${who}, totaling ${total.toLocaleString()}. Next scheduled deductions are one interval from now.`, allowedMentions: { users: accountId === interaction.user.id ? [] : [accountId] }, ...ephemeral });
+      await interaction.reply({ embeds: [chargeEmbed(`${kind === "tax" ? "Taxes" : "Bills"} settled`, `Settled **${charges.length}** ${kind === "tax" ? "tax(es)" : "bill(s)"} for ${who}, totaling **${total.toLocaleString()}**.\nNext scheduled deductions are one interval from now.`)], allowedMentions: { users: accountId === interaction.user.id ? [] : [accountId] }, ...ephemeral });
       for (const charge of charges) {
-        await sendUserNotice(interaction.client, accountId,
-          `PTB transaction: settled ${charge.kind} **${charge.name}** for ${Number(charge.amount).toLocaleString()}. This charge is recorded in your transaction history.`);
+        await sendUserNotice(interaction.client, accountId, {
+          embeds: [chargeEmbed(`${charge.kind === "tax" ? "Tax" : "Bill"} settled`, `**${charge.name}**\nAmount: **${Number(charge.amount).toLocaleString()}**\nRecorded in your transaction history.`)],
+        });
       }
     } catch (error) {
       await tx.rollback().catch(() => {});
@@ -148,8 +155,11 @@ export async function handleBillCommand(db, interaction, kind) {
     sql: "SELECT id, kind, name, amount, interval, next_due_at FROM recurring_charges WHERE discord_id = ? AND kind = ? AND active = 1 ORDER BY next_due_at",
     args: [interaction.user.id, kind],
   });
-  const lines = result.rows.map((row) => `#${row.id} **${row.kind} · ${row.name}** — ${Number(row.amount).toLocaleString()} / ${row.interval}, next <t:${Math.floor(new Date(row.next_due_at).getTime() / 1000)}:R>`);
-  await interaction.reply({ content: lines.length ? `**Your recurring ${kind === "tax" ? "taxes" : "bills"}**\n${lines.join("\n")}` : `You have no active recurring ${kind === "tax" ? "taxes" : "bills"}.`, ...ephemeral });
+  const visibleCharges = result.rows.slice(0, 20);
+  const lines = visibleCharges.map((row) => `**${row.name}** · ${Number(row.amount).toLocaleString()} / ${row.interval} · next <t:${Math.floor(new Date(row.next_due_at).getTime() / 1000)}:R>`);
+  const extra = result.rows.length > visibleCharges.length ? `\n…and ${result.rows.length - visibleCharges.length} more.` : "";
+  const description = lines.length ? `${lines.join("\n")}\n\nUse /${kind} settle to settle charges that are due.${extra}` : `You have no active recurring ${kind === "tax" ? "taxes" : "bills"}.`;
+  await interaction.reply({ embeds: [chargeEmbed(`Your recurring ${kind === "tax" ? "taxes" : "bills"}`, description)], ...ephemeral });
 }
 
 // Run at startup and every minute. The charge row's due timestamp is a claim
@@ -178,9 +188,11 @@ export async function processDueCharges(db, now = new Date(), client = null) {
       });
       await tx.commit();
       processed += 1;
-      const outcome = debit.rowsAffected === 1 ? "deducted" : "could not be deducted because the account is frozen or funds were insufficient";
-      await sendUserNotice(client, charge.discord_id,
-        `PTB transaction: recurring ${charge.kind} **${charge.name}** for ${Number(charge.amount).toLocaleString()} ${outcome}. Check your transaction history for the recorded result.`);
+      const succeeded = debit.rowsAffected === 1;
+      const outcome = succeeded ? "was deducted" : "could not be deducted because the account is frozen or funds were insufficient";
+      await sendUserNotice(client, charge.discord_id, {
+        embeds: [chargeEmbed(`${charge.kind === "tax" ? "Tax" : "Bill"} ${succeeded ? "deducted" : "not deducted"}`, `**${charge.name}**\nAmount: **${Number(charge.amount).toLocaleString()}** ${outcome}.\nCheck your transaction history for the recorded result.`, succeeded ? chargeColor : 0xD97706)],
+      });
     } catch (error) {
       // Fail closed for this occurrence (it is retried on the next run) and
       // keep processing the remaining due charges instead of aborting the
