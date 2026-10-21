@@ -282,9 +282,21 @@ const handleGuildMemberUpdate = createRegistrationEventHandler({
 });
 client.on(Events.GuildMemberUpdate, (oldMember, newMember) => void handleGuildMemberUpdate(oldMember, newMember));
 
+const INVITE_PERMISSIONS = 268_520_464; // Manage Channels, Manage Roles, View Channels, Send Messages, Embed Links, Read Message History
+
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
+  // Membership truth comes from the live gateway cache: registration can only
+  // ever work in a server this bot account actually joined.
+  const memberServers = readyClient.guilds.cache.map((guild) => `${guild.name} (${guild.id})`);
+  console.log(`[PTB Config] Bot is a member of ${memberServers.length} server${memberServers.length === 1 ? "" : "s"}: ${memberServers.join(", ") || "none"}`);
   if (!registrationConfig.ok) return;
+  if (!readyClient.guilds.cache.has(process.env.GUILD_ID)) {
+    console.error(`[PTB Config] GUILD_ID (${process.env.GUILD_ID}) is not a server this bot belongs to, so registration stays disabled.` +
+      " Fix by copying the correct Server ID (Discord Developer Mode: right-click the server icon -> Copy Server ID) into GUILD_ID and restarting, or re-invite the bot to that exact server:" +
+      ` https://discord.com/api/oauth2/authorize?client_id=${readyClient.application.id}&permissions=${INVITE_PERMISSIONS}&scope=bot%20applications.commands`);
+    return;
+  }
   try {
     const guild = await readyClient.guilds.fetch(process.env.GUILD_ID);
     await guild.roles.fetch();
@@ -302,7 +314,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     registrationRolesReady = true;
     console.log("[PTB Config] Registration role permissions and hierarchy verified.");
   } catch (error) {
-    console.error("[PTB Config] Could not verify registration roles; registration remains disabled.", error?.message ?? "unknown error");
+    console.error(`[PTB Config] Could not verify registration roles; registration remains disabled. ${error?.message ?? "unknown error"} (code ${error?.code ?? "?"})`);
   }
 });
 
