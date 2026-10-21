@@ -1,4 +1,5 @@
 const BLOXLINK_API_BASE = "https://api.blox.link/v4/public";
+export const BLOXLINK_VERIFY_URL = "https://blox.link/verify";
 
 export function validateRegistrationConfig(env = process.env) {
   const required = ["GUILD_ID", "BLOXLINK_VERIFIED_ROLE_ID", "REGISTERED_ROLE_ID", "BLOXLINK_API_KEY"];
@@ -110,10 +111,9 @@ export async function registerVerifiedIdentity(db, discordId, identity) {
 /** Coalesces repeated role events in this process. DB uniqueness remains the cross-process guard. */
 export function createRegistrationEventHandler({ db, guildId, verifiedRoleId, registeredRoleId, apiKey, enabled = true, logger = console, resolveIdentity = getBloxlinkVerifiedIdentity }) {
   const inFlight = new Map();
-  return async function onGuildMemberUpdate(oldMember, newMember) {
+  async function processVerifiedMember(newMember, { notify = true } = {}) {
     if (!(typeof enabled === "function" ? enabled() : enabled)) return;
     if (newMember.guild.id !== guildId) return;
-    if (oldMember.roles.cache.has(verifiedRoleId) || !newMember.roles.cache.has(verifiedRoleId)) return;
     const userId = newMember.id;
     if (inFlight.has(userId)) return inFlight.get(userId);
 
@@ -123,34 +123,48 @@ export function createRegistrationEventHandler({ db, guildId, verifiedRoleId, re
         const result = await registerVerifiedIdentity(db, userId, identity);
 
         if (result.status === "discord_conflict") {
-          await newMember.send("Your Discord account already has a PTB account linked to a different Roblox identity. PTB has not changed that link. Contact a PTB administrator if you need help.").catch(() => {});
-          return;
+          if (notify) await newMember.send("Your Discord account already has a PTB account linked to a different Roblox identity. PTB has not changed that link. Contact a PTB administrator if you need help.").catch(() => {});
+          return result;
         }
         if (result.status === "conflict") {
-          await newMember.send("PTB could not safely confirm your account link because another registration completed at the same time. Please contact a PTB administrator.").catch(() => {});
-          return;
+          if (notify) await newMember.send("PTB could not safely confirm your account link because another registration completed at the same time. Please contact a PTB administrator.").catch(() => {});
+          return result;
         }
 
         if (result.status === "roblox_conflict") {
-          await newMember.send(`Your Roblox account **${identity.robloxUsername}** is already linked to PTB. No duplicate account was created. Continue using PTB banking from the Discord account that is already linked.`).catch((error) => logger.warn("PTB could not send existing-link notice", { discordId: userId, reason: error?.message ?? "unknown error" }));
+          if (notify) await newMember.send(`Your Roblox account **${identity.robloxUsername}** is already linked to PTB. No duplicate account was created. Continue using PTB banking from the Discord account that is already linked.`).catch((error) => logger.warn("PTB could not send existing-link notice", { discordId: userId, reason: error?.message ?? "unknown error" }));
         } else if (result.status === "registered") {
-          await newMember.send(`Your Roblox account **${identity.robloxUsername}** is now registered with PTB.`).catch((error) => logger.warn("PTB could not send registration notice", { discordId: userId, reason: error?.message ?? "unknown error" }));
+          if (notify) await newMember.send(`Your Roblox account **${identity.robloxUsername}** is now registered with PTB.`).catch((error) => logger.warn("PTB could not send registration notice", { discordId: userId, reason: error?.message ?? "unknown error" }));
         }
 
         if (result.status !== "roblox_conflict" && !newMember.roles.cache.has(registeredRoleId)) {
           await newMember.roles.add(registeredRoleId, "PTB account registered through Bloxlink verification");
         }
-        await newMember.roles.remove(verifiedRoleId, "PTB processed Bloxlink verification");
+        if (newMember.roles.cache.has(verifiedRoleId)) {
+          await newMember.roles.remove(verifiedRoleId, "PTB processed Bloxlink verification");
+        }
+        return result;
       } catch (error) {
         logger.error("PTB Bloxlink registration failed", { discordId: userId, reason: error?.message ?? "unknown error" });
-        try {
-          await newMember.send("PTB could not finish registration right now. Your verification role is unchanged; please try again later or contact a PTB administrator.");
-        } catch (dmError) {
-          logger.warn("PTB could not send registration notice", { discordId: userId, reason: dmError?.message ?? "unknown error" });
+        if (notify) {
+          try {
+            await newMember.send("PTB could not finish registration right now. Your verification role is unchanged; please try again later or contact a PTB administrator.");
+          } catch (dmError) {
+            logger.warn("PTB could not send registration notice", { discordId: userId, reason: dmError?.message ?? "unknown error" });
+          }
         }
+        return { status: "error", error };
       }
     })();
     inFlight.set(userId, job);
-    try { await job; } finally { inFlight.delete(userId); }
-  };
+    try { return await job; } finally { inFlight.delete(userId); }
+  }
+
+  async function onGuildMemberUpdate(oldMember, newMember) {
+    if (oldMember.roles.cache.has(verifiedRoleId) || !newMember.roles.cache.has(verifiedRoleId)) return;
+    return processVerifiedMember(newMember);
+  }
+
+  onGuildMemberUpdate.processVerifiedMember = processVerifiedMember;
+  return onGuildMemberUpdate;
 }

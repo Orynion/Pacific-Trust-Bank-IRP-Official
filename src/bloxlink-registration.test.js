@@ -7,6 +7,7 @@ import { createClient } from "@libsql/client";
 import { schemaStatements } from "./bank-ops.js";
 import {
   createRegistrationEventHandler,
+  BLOXLINK_VERIFY_URL,
   getBloxlinkVerifiedIdentity,
   registerVerifiedIdentity,
   validateRegistrationConfig,
@@ -84,6 +85,10 @@ test("required Bloxlink role IDs and API key are validated", () => {
   assert.equal(validateRegistrationConfig({ GUILD_ID: guildId, BLOXLINK_VERIFIED_ROLE_ID: verifiedRoleId, REGISTERED_ROLE_ID: verifiedRoleId, BLOXLINK_API_KEY: apiKey }).ok, false);
 });
 
+test("registration uses Bloxlink's official verification page", () => {
+  assert.equal(BLOXLINK_VERIFY_URL, "https://blox.link/verify");
+});
+
 test("role permissions and hierarchy are required before registration can run", () => {
   assert.equal(validateRoleAssignmentAccess({
     hasManageRoles: true,
@@ -136,6 +141,30 @@ test("successful trusted registration assigns Registered and only then removes B
   assert.deepEqual(user.state.added, [registeredRoleId]);
   assert.deepEqual(user.state.removed, [verifiedRoleId]);
   assert.equal((await db.execute("SELECT COUNT(*) AS n FROM transactions")).rows[0].n, 0);
+});
+
+test("/register processing confirms through Bloxlink and creates the account even before the verified role arrives", async () => {
+  const db = await createDb();
+  const user = member(discordId, []);
+  const events = handler(db);
+  const result = await events.processVerifiedMember(user);
+  assert.equal(result.status, "registered");
+  const account = await db.execute({ sql: "SELECT roblox_id, roblox_username FROM accounts WHERE discord_id = ?", args: [discordId] });
+  assert.deepEqual(account.rows[0], { roblox_id: identity.robloxId, roblox_username: identity.robloxUsername });
+  assert.deepEqual(user.state.added, [registeredRoleId]);
+  assert.deepEqual(user.state.removed, []);
+});
+
+test("manual registration does not create an account when Bloxlink has no verified mapping", async () => {
+  const db = await createDb();
+  const user = member(discordId, []);
+  const events = handler(db, { resolveIdentity: async () => { throw new Error("HTTP 404"); } });
+  const result = await events.processVerifiedMember(user);
+  assert.equal(result.status, "error");
+  assert.match(result.error.message, /404/);
+  assert.equal((await db.execute("SELECT COUNT(*) AS n FROM accounts")).rows[0].n, 0);
+  assert.deepEqual(user.state.added, []);
+  assert.deepEqual(user.state.removed, []);
 });
 
 test("existing Roblox link does not create a second bank identity and is acknowledged", async () => {

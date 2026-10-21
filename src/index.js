@@ -3,6 +3,9 @@ import { createServer } from "node:http";
 import { createClient } from "@libsql/client";
 import {
   Client,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
@@ -21,7 +24,7 @@ import {
   handleTransfer,
   schemaStatements,
 } from "./bank-ops.js";
-import { createRegistrationEventHandler, validateRegistrationConfig, validateRoleAssignmentAccess } from "./bloxlink-registration.js";
+import { BLOXLINK_VERIFY_URL, createRegistrationEventHandler, validateRegistrationConfig, validateRoleAssignmentAccess } from "./bloxlink-registration.js";
 import { handleTicketClose, handleTicketDecision, ticketSchemaStatements } from "./ticket-ops.js";
 
 const requiredEnv = ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID", "TURSO_URL", "TURSO_AUTH_TOKEN"];
@@ -75,11 +78,7 @@ const helpCommand = new SlashCommandBuilder()
 
 const registerCommand = new SlashCommandBuilder()
   .setName("register")
-  .setDescription("Check your PTB registration status or learn how to register.");
-
-const verifyCommand = new SlashCommandBuilder()
-  .setName("verify")
-  .setDescription("Check your PTB link or learn how to register through Bloxlink.");
+  .setDescription("Register your Roblox account with PTB through Bloxlink verification.");
 
 const balanceCommand = new SlashCommandBuilder()
   .setName("balance")
@@ -164,8 +163,7 @@ function createHelpEmbed(isAdministrator) {
       {
         name: "Account",
         value: [
-          "`/register` — Check your PTB registration or learn how to register.\nExample: `/register`",
-          "`/verify` — Check your PTB link or learn how to register through Bloxlink.\nExample: `/verify`",
+          "`/register` — Check Bloxlink and register your linked Roblox account. PTB also registers automatically after Bloxlink verification.\nExample: `/register`",
           "`/balance` — Privately check your own PTB balance.\nExample: `/balance`",
           "`/bill list` and `/tax list` — View recurring bills and taxes separately. Use `/bill settle` or `/tax settle` to settle due charges of that type.",
         ].join("\n\n"),
@@ -203,7 +201,7 @@ async function handleTransactionHistory(interaction) {
   await interaction.reply(await getTransactionHistory(db, interaction.user.id, 0));
 }
 
-async function handleVerify(interaction) {
+async function handleRegister(interaction) {
   const accountResult = await db.execute({
     sql: "SELECT roblox_username FROM accounts WHERE discord_id = ? LIMIT 1",
     args: [interaction.user.id],
@@ -216,11 +214,33 @@ async function handleVerify(interaction) {
     await interaction.reply({ content: "PTB account registration is not configured yet. Please contact a PTB administrator.", ...ephemeralReply });
     return;
   }
-  await interaction.reply({ content: "First verify with Bloxlink in this server. PTB will register you after the configured Bloxlink verification role is added.", ...ephemeralReply });
-}
+  const member = await interaction.guild?.members.fetch(interaction.user.id);
+  if (!member) {
+    await interaction.reply({ content: "Run `/register` in the configured Discord server so PTB can check your Bloxlink link.", ...ephemeralReply });
+    return;
+  }
 
-async function handleRegister(interaction) {
-  await handleVerify(interaction);
+  await interaction.deferReply(ephemeralReply);
+  const result = await handleGuildMemberUpdate.processVerifiedMember(member, { notify: false });
+  if (result?.status === "registered" || result?.status === "existing_same") {
+    const registeredAccount = await db.execute({
+      sql: "SELECT roblox_username FROM accounts WHERE discord_id = ? LIMIT 1",
+      args: [interaction.user.id],
+    });
+    const username = registeredAccount.rows[0]?.roblox_username;
+    await interaction.editReply(username ? `Your Roblox account **${username}** is registered with PTB.` : "Your account is registered with PTB.");
+  } else if (result?.status === "roblox_conflict") {
+    await interaction.editReply("That Roblox account is already linked to another PTB account. Contact a PTB administrator if you think this is a mistake.");
+  } else if (result?.status === "error" && /HTTP 404|did not return a verified Roblox ID/.test(result.error?.message ?? "")) {
+    await interaction.editReply({
+      content: "Bloxlink has not linked a Roblox account to you yet. Click **Verify with Bloxlink** below. After Bloxlink finishes, PTB will detect the link and register your account automatically.",
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel("Verify with Bloxlink").setStyle(ButtonStyle.Link).setURL(BLOXLINK_VERIFY_URL),
+      )],
+    });
+  } else {
+    await interaction.editReply("PTB could not complete registration. Your Bloxlink verification is unchanged; please try again later or contact a PTB administrator.");
+  }
 }
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 const registrationConfig = validateRegistrationConfig(process.env);
@@ -324,8 +344,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply("pong");
     } else if (interaction.commandName === "register") {
       await handleRegister(interaction);
-    } else if (interaction.commandName === "verify") {
-      await handleVerify(interaction);
     } else if (interaction.commandName === "balance") {
       await handleBalance(db, interaction);
     } else if (interaction.commandName === "transaction" && interaction.options.getSubcommand() === "history") {
@@ -379,7 +397,6 @@ try {
             helpCommand.toJSON(),
             pingCommand.toJSON(),
             registerCommand.toJSON(),
-            verifyCommand.toJSON(),
             balanceCommand.toJSON(),
             transactionCommand.toJSON(),
             depositCommand.toJSON(),
