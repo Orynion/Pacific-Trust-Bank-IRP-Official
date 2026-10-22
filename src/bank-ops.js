@@ -189,7 +189,7 @@ export async function handleMoneyRequest(db, interaction, type) {
 
   try {
     const requestDetails = type === "deposit"
-      ? `Please provide any details or proof needed to review your deposit request for **${amount.toLocaleString()}**.`
+      ? `🧪 **EXPERIMENTAL RECEIPT DETECTION**\nUpload your in-game transaction screenshot here as your first message. PTB will run advisory OCR and duplicate checks, then show the findings below. Detection can miss or misread details and does not prove a transfer; a reviewer must inspect the screenshot before approving.\n\nPlease add any context needed to review your deposit for **${amount.toLocaleString()}**.`
       : `Please provide any details needed to review your withdrawal request for **${amount.toLocaleString()}**. Your balance was **${balance.toLocaleString()}** when you opened this ticket. This request does not reserve funds, so your available balance may change before it is processed.`;
     const decisionDetails = type === "deposit"
       ? `Administrator workflow: press **Approve** once receipt of the in-game funds is verified, then **Credit & finalise** to move the ledger funds. Nothing is credited until the deposit is completed.`
@@ -211,7 +211,7 @@ export async function handleMoneyRequest(db, interaction, type) {
       .setLabel("Close ticket")
       .setStyle(ButtonStyle.Secondary);
     await channel.send({
-      content: `${interaction.user} opened a **${type} request** for **${amount.toLocaleString()}**.\n\n${requestDetails}\n\nThis is a private ticket visible to you, the bot, and server administrators. The request is stored as ticket **${ticketCode}** (status: pending); opening it does not change your PTB balance.\n\n${decisionDetails}\nClosing the ticket while it is still pending records it as rejected.`,
+      content: `${type === "deposit" ? "🧪 **EXPERIMENTAL FEATURE**\n\n" : ""}${interaction.user} opened a **${type} request** for **${amount.toLocaleString()}**.\n\n${requestDetails}\n\nThis is a private ticket visible to you, the bot, and server administrators. The request is stored as ticket **${ticketCode}** (status: pending); opening it does not change your PTB balance.\n\n${decisionDetails}\nClosing the ticket while it is still pending records it as rejected.`,
       components: [
         new ActionRowBuilder().addComponents(approveButton, rejectButton),
         new ActionRowBuilder().addComponents(completeButton, closeButton),

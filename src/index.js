@@ -26,6 +26,7 @@ import {
 } from "./bank-ops.js";
 import { BLOXLINK_VERIFY_URL, createRegistrationEventHandler, validateRegistrationConfig, validateRoleAssignmentAccess } from "./bloxlink-registration.js";
 import { handleTicketClose, handleTicketDecision, ticketSchemaStatements } from "./ticket-ops.js";
+import { handleDepositTicketImage, handleTreasuryButton, handleTreasuryHistory, handleTreasuryModal, handleTreasuryReport, handleTreasurySearch, handleTreasuryStatus, handleTreasuryTotal, submitTreasuryPayment, treasurySchemaStatements } from "./treasury-ops.js";
 
 const requiredEnv = ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID", "TURSO_URL", "TURSO_AUTH_TOKEN"];
 const missingEnv = requiredEnv.filter((name) => !process.env[name]);
@@ -154,6 +155,22 @@ function createRecurringCommand(kind) {
 const billCommand = createRecurringCommand("bill");
 const taxCommand = createRecurringCommand("tax");
 
+const treasurySubmitCommand = new SlashCommandBuilder().setName("treasury-submit").setDescription("Submit an in-game IRP Treasury payment receipt for review.")
+  .addStringOption((o) => o.setName("payer").setDescription("Roblox username that made the payment.").setRequired(true).setMaxLength(20))
+  .addIntegerOption((o) => o.setName("amount").setDescription("Amount paid in game.").setMinValue(1).setMaxValue(2_147_483_647).setRequired(true))
+  .addStringOption((o) => o.setName("purpose").setDescription("Payment purpose or description.").setRequired(true).setMaxLength(500))
+  .addAttachmentOption((o) => o.setName("screenshot").setDescription("Screenshot of the transaction.").setRequired(true));
+const treasuryStatusCommand = new SlashCommandBuilder().setName("treasury-status").setDescription("Check your IRP Treasury submission status.")
+  .addStringOption((o) => o.setName("reference").setDescription("Receipt reference, for example IRPT-000001.").setRequired(true).setMaxLength(20));
+const treasuryHistoryCommand = new SlashCommandBuilder().setName("treasury-history").setDescription("View your recent IRP Treasury submissions.");
+const treasurySearchCommand = new SlashCommandBuilder().setName("treasury-search").setDescription("Search IRP Treasury submissions (reviewers only).")
+  .addStringOption((o) => o.setName("query").setDescription("Receipt reference or exact Roblox username.").setRequired(true).setMaxLength(20));
+const treasuryReportCommand = new SlashCommandBuilder().setName("treasury-report").setDescription("Show IRP Treasury review and verified totals (reviewers only).")
+  .addStringOption((o) => o.setName("from").setDescription("Start date YYYY-MM-DD (inclusive)."))
+  .addStringOption((o) => o.setName("to").setDescription("End date YYYY-MM-DD (inclusive)."));
+const treasuryTotalCommand = new SlashCommandBuilder().setName("treasury-total").setDescription("Show total verified IRP Treasury payments (reviewers only).");
+const TREASURY_REVIEW_ROLES = process.env.TREASURY_REVIEWER_ROLE_IDS || "";
+
 function createHelpEmbed(isAdministrator) {
   const embed = new EmbedBuilder()
     .setColor(0x0B3D2E)
@@ -180,6 +197,14 @@ function createHelpEmbed(isAdministrator) {
           "`/deposit amount` — Open a private ticket to request a deposit.\nExample: `/deposit amount:500`",
           "`/withdraw amount` — Open a private ticket to request a withdrawal.\nExample: `/withdraw amount:250`",
           "`/transfer user amount confirm` — Transfer ledger funds to another user.\nExample: `/transfer user:@Alex amount:100 confirm:True`",
+        ].join("\n\n"),
+      },
+      {
+        name: "IRP Treasury payments",
+        value: [
+          "`/treasury-submit payer amount purpose screenshot` — Submit an in-game payment screenshot for authorized review.",
+          "`/treasury-status reference` and `/treasury-history` — Privately check your own submissions.",
+          "`/treasury-search`, `/treasury-report`, `/treasury-total` — Treasury staff tools for configured reviewers and administrators.",
         ].join("\n\n"),
       },
     );
@@ -307,7 +332,7 @@ async function handleUnregister(interaction) {
   await interaction.editReply(`Your Roblox account has been disconnected from PTB. Your PTB balance and transaction history were kept. Run /register to link an account again.${roleNote}`);
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const registrationConfig = validateRegistrationConfig(process.env);
 if (!registrationConfig.ok) console.error(`[PTB Config] Registration unavailable; set valid guild, role IDs, and Bloxlink API key: ${registrationConfig.missing.join(", ")}`);
 let registrationRolesReady = false;
@@ -320,6 +345,9 @@ const handleGuildMemberUpdate = createRegistrationEventHandler({
   apiKey: process.env.BLOXLINK_API_KEY,
 });
 client.on(Events.GuildMemberUpdate, (oldMember, newMember) => void handleGuildMemberUpdate(oldMember, newMember));
+client.on(Events.MessageCreate, (message) => {
+  void handleDepositTicketImage(db, message).catch((error) => console.error("PTB experimental deposit receipt detection failed:", error));
+});
 
 const INVITE_PERMISSIONS = 268_520_464; // Manage Channels, Manage Roles, View Channels, Send Messages, Embed Links, Read Message History
 
@@ -358,7 +386,18 @@ client.once(Events.ClientReady, async (readyClient) => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isModalSubmit() && interaction.customId.startsWith("trm-")) {
+    try { await handleTreasuryModal(db, interaction, TREASURY_REVIEW_ROLES); }
+    catch (error) { console.error("PTB treasury modal failed:", error); await interaction.reply({ content: "I could not process that treasury review action.", ...ephemeralReply }).catch(() => {}); }
+    return;
+  }
   if (interaction.isButton()) {
+    const treasuryMatch = interaction.customId.match(/^trv-(approve|approve-confirm|reject|info|flag):(IRPT-\d+)$/);
+    if (treasuryMatch) {
+      try { await handleTreasuryButton(db, interaction, treasuryMatch[1], treasuryMatch[2], TREASURY_REVIEW_ROLES); }
+      catch (error) { console.error("PTB treasury review failed:", error); await interaction.reply({ content: "I could not process that treasury review action.", ...ephemeralReply }).catch(() => {}); }
+      return;
+    }
     const ticketDecisionMatch = interaction.customId.match(/^tkt-(approve|complete|reject):(\d+)$/);
     if (ticketDecisionMatch) {
       try {
@@ -415,7 +454,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
   if (!interaction.isChatInputCommand()) return;
   try {
-    if (interaction.commandName !== "register" && interaction.commandName !== "unregister") {
+    if (interaction.commandName !== "register" && interaction.commandName !== "unregister" &&
+        !["treasury-search", "treasury-report", "treasury-total"].includes(interaction.commandName)) {
       const accountResult = await db.execute({
         sql: "SELECT 1 FROM accounts WHERE discord_id = ? AND roblox_id IS NOT NULL LIMIT 1",
         args: [interaction.user.id],
@@ -451,6 +491,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleTransfer(db, interaction);
     } else if (interaction.commandName === "bill" || interaction.commandName === "tax") {
       await handleBillCommand(db, interaction, interaction.commandName);
+    } else if (interaction.commandName === "treasury-submit") {
+      await submitTreasuryPayment(db, interaction, { reviewChannelId: process.env.TREASURY_REVIEW_CHANNEL_ID, reviewerRoleIds: TREASURY_REVIEW_ROLES });
+    } else if (interaction.commandName === "treasury-status") {
+      await handleTreasuryStatus(db, interaction, interaction.options.getString("reference", true));
+    } else if (interaction.commandName === "treasury-history") {
+      await handleTreasuryHistory(db, interaction);
+    } else if (interaction.commandName === "treasury-search") {
+      await handleTreasurySearch(db, interaction, TREASURY_REVIEW_ROLES, interaction.options.getString("query", true));
+    } else if (interaction.commandName === "treasury-report") {
+      const from = interaction.options.getString("from");
+      const to = interaction.options.getString("to");
+      const validDate = (value) => !value || (/^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)));
+      if (!validDate(from) || !validDate(to) || (from && to && from > to)) await interaction.reply({ content: "Use valid dates in YYYY-MM-DD format, with from on or before to.", ...ephemeralReply });
+      else await handleTreasuryReport(db, interaction, TREASURY_REVIEW_ROLES, { from, to });
+    } else if (interaction.commandName === "treasury-total") {
+      await handleTreasuryTotal(db, interaction, TREASURY_REVIEW_ROLES);
     }
   } catch (error) {
     console.error(`Command /${interaction.commandName} failed:`, error);
@@ -471,7 +527,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 try {
-  await db.batch([...schemaStatements, ...ticketSchemaStatements, ...recurringChargeSchemaStatements], "write");
+  await db.batch([...schemaStatements, ...ticketSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements], "write");
   console.log("PTB ledger database initialized successfully.");
 
   const hasDiscordConfig = Boolean(
@@ -499,6 +555,12 @@ try {
             transferCommand.toJSON(),
             billCommand.toJSON(),
             taxCommand.toJSON(),
+            treasurySubmitCommand.toJSON(),
+            treasuryStatusCommand.toJSON(),
+            treasuryHistoryCommand.toJSON(),
+            treasurySearchCommand.toJSON(),
+            treasuryReportCommand.toJSON(),
+            treasuryTotalCommand.toJSON(),
           ],
         },
       );
