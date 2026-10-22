@@ -771,10 +771,10 @@ test("tickets 18: an approved ticket survives a restart and completes exactly on
       assert.equal((await getTicket(db2, ticketId)).status, "approved", "in-flight ticket survives restart");
       assert.equal((await getTicket(db2, ticketId)).decision_by, ADMIN_A, "the approver survives the restart");
 
-      // /balance remains readable on the restarted instance.
+      // /balance remains readable on the restarted instance (embed reply).
       const balanceCheck = ticketInteraction({ userId: "990000000000000009" });
       await handleBalance(db2, balanceCheck);
-      assert.match(balanceCheck.state.replies[0].content, /Your current PTB balance is 1,000\./);
+      assert.match(balanceCheck.state.replies[0].embeds[0].data.description, /1,000/);
 
       const payout = decide(db2, { adminId: ADMIN_B, action: "complete", ticketId });
       await payout.run;

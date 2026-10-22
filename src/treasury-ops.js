@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { inflateSync } from "node:zlib";
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, EmbedBuilder, MessageFlags, ModalBuilder, PermissionFlagsBits, TextInputBuilder, TextInputStyle } from "discord.js";
+import { AMOUNT_MISMATCH, AMOUNT_NEEDS_REVIEW, buildAmountCheckerMessage, checkScreenshotAmount, describeAmountComparison } from "./amount-checker.js";
 
 export const TREASURY_STATUSES = ["PENDING", "NEEDS_REVIEW", "VERIFIED", "REJECTED", "DUPLICATE"];
 export const treasurySchemaStatements = [
@@ -20,6 +21,7 @@ export const treasurySchemaStatements = [
     extracted_payer TEXT,
     extracted_recipient TEXT,
     extracted_amount INTEGER,
+    amount_comparison TEXT,
     transaction_id TEXT,
     findings TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL CHECK(status IN ('PENDING','NEEDS_REVIEW','VERIFIED','REJECTED','DUPLICATE')),
@@ -66,7 +68,31 @@ export const treasurySchemaStatements = [
 
 export const treasuryEphemeral = { flags: MessageFlags.Ephemeral };
 const maxImageBytes = 8 * 1024 * 1024;
-const amountPattern = /(?:\$|€|£)?\s*([\d,]+)\s*(?:cash|money|amount)?/i;
+
+// Startup migration for databases created before the amount checker existed:
+// adds the amount_comparison column when it is missing. The fresh schema above
+// already contains it, so the ALTER TABLE then reports a duplicate column,
+// which is tolerated. The returned flag also lets submissions degrade safely:
+// if the column can never be created, the comparison is simply not recorded.
+let amountComparisonColumnReady = true;
+export function amountComparisonColumnAvailable() {
+  return amountComparisonColumnReady;
+}
+
+export async function ensureAmountComparisonColumn(db) {
+  try {
+    await db.execute("ALTER TABLE treasury_submissions ADD COLUMN amount_comparison TEXT");
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    if (!/duplicate column|already exists/i.test(message)) {
+      amountComparisonColumnReady = false;
+      console.error("PTB treasury amount-comparison column migration failed:", message);
+      return false;
+    }
+  }
+  amountComparisonColumnReady = true;
+  return true;
+}
 
 export function treasuryReviewer(interaction, roleIds = "") {
   if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return true;
@@ -74,33 +100,49 @@ export function treasuryReviewer(interaction, roleIds = "") {
   return Boolean(roles && roleIds.split(",").map((id) => id.trim()).filter(Boolean).some((id) => roles.has(id)));
 }
 
-export function inspectReceiptText(text, { payer, amount }) {
+export function inspectReceiptText(text, { payer, amount } = {}) {
   const normalized = String(text ?? "").replace(/\s+/g, " ").trim();
   const lower = normalized.toLowerCase();
   const payerMatch = payer && lower.includes(payer.toLowerCase());
   const recipientMatch = /\b(irp\s*treasury|treasury)\b/i.test(normalized);
-  const parsedAmount = (normalized.match(/(?:amount|paid|payment|transferred|transfer)\D{0,20}([\d,]+)/i)?.[1]
-    ?? normalized.match(amountPattern)?.[1])?.replaceAll(",", "");
-  const extractedAmount = parsedAmount && Number.isSafeInteger(Number(parsedAmount)) ? Number(parsedAmount) : null;
+  // Amount checker: only transaction-labelled numbers may become the extracted
+  // amount; anything unreadable or ambiguous is recorded as NEEDS_REVIEW.
+  const amountCheck = checkScreenshotAmount(text, amount);
+  const extractedAmount = amountCheck.extractedAmount;
   const transactionId = normalized.match(/(?:transaction|receipt|reference|trans(?:action)?\s*id)\s*[:#-]?\s*([a-z0-9-]{4,})/i)?.[1] ?? null;
   const findings = [];
   if (!normalized) findings.push("OCR_UNAVAILABLE_OR_UNREADABLE");
   if (!payerMatch) findings.push(normalized ? "PAYER_NOT_CONFIRMED_BY_OCR" : "PAYER_NOT_READABLE");
   if (!recipientMatch) findings.push("RECIPIENT_NOT_CONFIRMED_BY_OCR");
-  if (extractedAmount === null) findings.push("AMOUNT_NOT_READABLE");
-  else if (extractedAmount !== amount) findings.push("AMOUNT_MISMATCH");
-  return { extractedPayer: payerMatch ? payer : null, extractedRecipient: recipientMatch ? "IRP Treasury" : null, extractedAmount, transactionId, findings };
+  if (amountCheck.comparison === AMOUNT_MISMATCH) findings.push("AMOUNT_MISMATCH");
+  else if (amountCheck.comparison === AMOUNT_NEEDS_REVIEW) findings.push("AMOUNT_NOT_READABLE");
+  return { extractedPayer: payerMatch ? payer : null, extractedRecipient: recipientMatch ? "IRP Treasury" : null, extractedAmount, transactionId, findings, amountCheck };
 }
 
-function runOcr(bytes) {
+function defaultRunOcr(bytes) {
   // Tesseract is optional and local. Its output is a review hint only; absence
-  // or failure must never reject a receipt.
-  const result = spawnSync("tesseract", ["stdin", "stdout", "--psm", "6"], { input: bytes, encoding: "utf8", timeout: 8_000, maxBuffer: 128 * 1024 });
+  // or failure must never reject a receipt. TESSERACT_PATH can point at a
+  // non-default binary location (for example a Windows install or a Bothost
+  // container path).
+  const command = process.env.TESSERACT_PATH || "tesseract";
+  const result = spawnSync(command, ["stdin", "stdout", "--psm", "6"], { input: bytes, encoding: "utf8", timeout: 8_000, maxBuffer: 128 * 1024 });
   return result.status === 0 ? result.stdout.trim() : "";
 }
 
+// Test-only OCR engine override so the submission flow can be tested without
+// a local Tesseract installation. Passing null restores the default engine.
+let ocrEngineOverride = null;
+export function __setTreasuryOcrForTests(override) {
+  ocrEngineOverride = typeof override === "function" ? override : null;
+}
+
 export async function analyzeReceipt(bytes, claimed) {
-  const ocrText = runOcr(bytes);
+  let ocrText = "";
+  try {
+    ocrText = String((ocrEngineOverride ? await ocrEngineOverride(bytes) : defaultRunOcr(bytes)) ?? "").trim();
+  } catch (error) {
+    console.warn("PTB treasury OCR failed:", error?.message ?? String(error));
+  }
   return {
     hash: createHash("sha256").update(bytes).digest("hex"),
     ocrText,
@@ -186,7 +228,7 @@ function makeReviewEmbed(row) {
     .setTitle(`Treasury receipt ${row.reference}`)
     .setDescription(`**Status:** ${row.status}\n**Claimed payer:** ${row.payer_username}\n**Claimed amount:** ${Number(row.amount).toLocaleString()}\n**Purpose:** ${row.purpose}\n**Submitter:** <@${row.submitter_id}>`)
     .addFields(
-      { name: "Screenshot analysis (assessment only)", value: `Payer: ${row.extracted_payer ?? "not confirmed"}\nRecipient: ${row.extracted_recipient ?? "not confirmed"}\nAmount: ${row.extracted_amount ?? "not readable"}\nTransaction ID: ${row.transaction_id ?? "not found"}` },
+      { name: "Screenshot analysis (assessment only)", value: `Payer: ${row.extracted_payer ?? "not confirmed"}\nRecipient: ${row.extracted_recipient ?? "not confirmed"}\nAmount: ${row.extracted_amount ?? "not readable"}\nAmount comparison: ${describeAmountComparison(row.amount_comparison)}\nTransaction ID: ${row.transaction_id ?? "not found"}` },
       { name: "Automated findings", value: findings.length ? findings.join(", ") : "No discrepancies detected; image analysis does not prove transfer authenticity." },
       ...(row.duplicate_of ? [{ name: "Duplicate match", value: `Related receipt: ${row.duplicate_of}` }] : []),
     ).setImage(row.attachment_url).setFooter({ text: "Screenshot-assisted review; authorized human approval is required." });
@@ -232,8 +274,13 @@ export async function submitTreasuryPayment(db, interaction, { reviewChannelId, 
     else if (visualMatch) findings.push("PERCEPTUALLY_SIMILAR_SCREENSHOT_REQUIRES_REVIEW");
     else if (duplicateOf) findings.push("SIMILAR_PAYER_AMOUNT_REQUIRES_REVIEW");
     status = exactDuplicate ? "DUPLICATE" : (duplicateOf || analysis.findings.length ? "NEEDS_REVIEW" : "PENDING");
-    const inserted = await tx.execute({ sql: `INSERT INTO treasury_submissions (submitter_id,payer_username,amount,purpose,attachment_url,attachment_name,screenshot_hash,perceptual_hash,ocr_text,extracted_payer,extracted_recipient,extracted_amount,transaction_id,findings,status,duplicate_of)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, args: [interaction.user.id, payer, amount, purpose, attachment.url, attachment.name, analysis.hash, analysis.perceptualHash, analysis.ocrText, analysis.extractedPayer, analysis.extractedRecipient, analysis.extractedAmount, analysis.transactionId, JSON.stringify(findings), status, duplicateOf] });
+    // The automatic amount checker stores its outcome with the record; it only
+    // informs review and never verifies or rejects a payment on its own.
+    const recordComparison = amountComparisonColumnAvailable() ? analysis.amountCheck.comparison : null;
+    const insertColumns = `submitter_id,payer_username,amount,purpose,attachment_url,attachment_name,screenshot_hash,perceptual_hash,ocr_text,extracted_payer,extracted_recipient,extracted_amount,transaction_id,findings,status,duplicate_of`;
+    const insertPlaceholders = "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?";
+    const insertArgs = [interaction.user.id, payer, amount, purpose, attachment.url, attachment.name, analysis.hash, analysis.perceptualHash, analysis.ocrText, analysis.extractedPayer, analysis.extractedRecipient, analysis.extractedAmount, analysis.transactionId, JSON.stringify(findings), status, duplicateOf];
+    const inserted = await tx.execute({ sql: `INSERT INTO treasury_submissions (${insertColumns}${recordComparison ? ",amount_comparison" : ""}) VALUES (${insertPlaceholders}${recordComparison ? ",?" : ""})`, args: recordComparison ? [...insertArgs, recordComparison] : insertArgs });
     const id = Number(inserted.lastInsertRowid);
     reference = `IRPT-${String(id).padStart(6, "0")}`;
     await tx.execute({ sql: "UPDATE treasury_submissions SET reference = ? WHERE id = ?", args: [reference, id] });
@@ -263,7 +310,13 @@ export async function submitTreasuryPayment(db, interaction, { reviewChannelId, 
     await audit(db, reference, interaction.user.id, "REVIEW_CHANNEL_DELIVERY_FAILED", status, "NEEDS_REVIEW", "Could not deliver review message");
     return interaction.editReply(`Receipt ${reference} is recorded as NEEDS_REVIEW, but the review channel could not be notified. Please contact treasury staff.`);
   }
-  await interaction.editReply(`Receipt **${reference}** recorded with status **${status}**. Screenshot analysis is advisory; a treasury reviewer must confirm the payment.`);
+  await interaction.editReply(buildAmountCheckerMessage({
+    comparison: row.amount_comparison ?? analysis.amountCheck?.comparison ?? AMOUNT_NEEDS_REVIEW,
+    claimedAmount: amount,
+    extractedAmount: analysis.extractedAmount,
+    status,
+    reference,
+  }));
 }
 
 function isSupportedImage(bytes) {
@@ -307,7 +360,7 @@ export async function handleDepositTicketImage(db, message) {
       const checks = [
         `Payer (${claimedPayer || "account has no linked Roblox name"}): ${analysis.extractedPayer ? "matched" : "not confirmed by OCR"}`,
         `Recipient: ${analysis.extractedRecipient ?? "not confirmed by OCR"}`,
-        `Amount: ${analysis.extractedAmount ?? "not readable"}${analysis.extractedAmount !== null && analysis.extractedAmount !== Number(ticket.amount) ? ` (ticket claims ${Number(ticket.amount).toLocaleString()})` : ""}`,
+        `Amount: ${analysis.extractedAmount ?? "not readable"}${analysis.amountCheck?.comparison === "MATCH" ? " (matches ticket amount)" : analysis.extractedAmount !== null && analysis.extractedAmount !== Number(ticket.amount) ? ` (ticket claims ${Number(ticket.amount).toLocaleString()})` : ""}`,
         `Duplicate: ${related ? `exact match to ${related}` : visualMatch ? `visually similar to ${visualMatch.reference ?? "a prior receipt"}` : "no exact or visual match found"}`,
         `Findings: ${findings.length ? findings.join(", ") : "No OCR discrepancy detected"}`,
       ];

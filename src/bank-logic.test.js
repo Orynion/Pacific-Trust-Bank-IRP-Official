@@ -246,7 +246,8 @@ test("case 1: /balance works once the account is registered (and stays private)"
     const interaction = createInteraction({ userId: "200000000000000002" });
     await handleBalance(db, interaction);
 
-    assert.match(interaction.state.replies[0].content, /Your current PTB balance is 4,321\./);
+    // /balance replies with a private embed carrying the balance value.
+    assert.match(interaction.state.replies[0].embeds[0].data.description, /4,321/);
     assert.equal(interaction.state.replies[0].flags, MessageFlags.Ephemeral);
   } finally {
     await db.close();

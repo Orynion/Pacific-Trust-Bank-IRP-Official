@@ -26,7 +26,7 @@ import {
 } from "./bank-ops.js";
 import { BLOXLINK_VERIFY_URL, createRegistrationEventHandler, validateRegistrationConfig, validateRoleAssignmentAccess } from "./bloxlink-registration.js";
 import { handleTicketClose, handleTicketDecision, ticketSchemaStatements } from "./ticket-ops.js";
-import { handleDepositTicketImage, handleTreasuryButton, handleTreasuryHistory, handleTreasuryModal, handleTreasuryReport, handleTreasurySearch, handleTreasuryStatus, handleTreasuryTotal, submitTreasuryPayment, treasurySchemaStatements } from "./treasury-ops.js";
+import { ensureAmountComparisonColumn, handleDepositTicketImage, handleTreasuryButton, handleTreasuryHistory, handleTreasuryModal, handleTreasuryReport, handleTreasurySearch, handleTreasuryStatus, handleTreasuryTotal, submitTreasuryPayment, treasurySchemaStatements } from "./treasury-ops.js";
 
 const requiredEnv = ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID", "TURSO_URL", "TURSO_AUTH_TOKEN"];
 const missingEnv = requiredEnv.filter((name) => !process.env[name]);
@@ -528,6 +528,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 try {
   await db.batch([...schemaStatements, ...ticketSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements], "write");
+  // Adds amount_comparison to treasury tables created before the automatic
+  // amount checker; fresh tables already include it and this call is idempotent.
+  await ensureAmountComparisonColumn(db);
   console.log("PTB ledger database initialized successfully.");
 
   const hasDiscordConfig = Boolean(

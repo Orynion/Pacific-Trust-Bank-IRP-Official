@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { PermissionFlagsBits } from "discord.js";
-import { applyTreasuryReview, handleDepositTicketImage, handleTreasuryButton, handleTreasuryReport, inspectReceiptText, submitTreasuryPayment, treasuryReviewer, treasurySchemaStatements, validateReceiptInput } from "./treasury-ops.js";
+import { __setTreasuryOcrForTests, analyzeReceipt, applyTreasuryReview, ensureAmountComparisonColumn, handleDepositTicketImage, handleTreasuryButton, handleTreasuryReport, inspectReceiptText, submitTreasuryPayment, treasuryReviewer, treasurySchemaStatements, validateReceiptInput } from "./treasury-ops.js";
 import { schemaStatements } from "./bank-ops.js";
 import { ticketSchemaStatements } from "./ticket-ops.js";
 
@@ -119,4 +120,140 @@ test("first image in a pending deposit ticket gets an advisory detection report"
     const saved = await db.execute("SELECT ticket_id,extracted_amount FROM treasury_ticket_receipt_checks");
     assert.equal(Number(saved.rows[0].ticket_id), 7);
   } finally { globalThis.fetch = originalFetch; await db.close(); }
+});
+
+const submissionPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/pZ8AAAAASUVORK5CYII=", "base64");
+
+function makeSubmitInteraction({ payer = "Alice_1", amount = 5000, purpose = "Salary" } = {}) {
+  const replies = [];
+  return {
+    replies,
+    user: { id: "100" },
+    client: { channels: { fetch: async () => ({ guildId: "guild", type: 0, permissionsFor: (target) => ({ has: () => target !== "everyone" }), send: async () => {} }) } },
+    guild: { id: "guild", roles: { everyone: "everyone", cache: new Map() }, members: { me: "bot" } },
+    options: {
+      getString: (name) => name === "payer" ? payer : purpose,
+      getInteger: () => amount,
+      getAttachment: () => ({ contentType: "image/png", size: submissionPng.length, url: "https://cdn.example/receipt.png", name: "receipt.png" }),
+    },
+    inGuild: () => true,
+    deferReply: async () => {},
+    editReply: async (content) => replies.push(content),
+  };
+}
+
+async function submitWithOcr(db, ocrText, options) {
+  __setTreasuryOcrForTests(async () => ocrText);
+  try {
+    const interaction = makeSubmitInteraction(options);
+    await submitTreasuryPayment(db, interaction, { reviewChannelId: "chan" });
+    return interaction.replies;
+  } finally { __setTreasuryOcrForTests(null); }
+}
+
+const originalFetchHolder = { value: globalThis.fetch };
+
+test("amount checker replies MATCH, records the comparison, and keeps manual verification", async () => {
+  const db = await openDb();
+  globalThis.fetch = async () => new Response(submissionPng, { status: 200, headers: { "content-length": String(submissionPng.length) } });
+  try {
+    const replies = await submitWithOcr(db, "Payer Alice_1 paid Amount: 5,000 to IRP Treasury Transaction ID: TX-0099", { amount: 5000 });
+    assert.match(replies[0], /🟢 Amount Match/);
+    assert.match(replies[0], /Claimed amount: \$5,000/);
+    assert.match(replies[0], /Screenshot amount: \$5,000/);
+    assert.match(replies[0], /Status: Pending manual verification\./);
+    assert.match(replies[0], /IRPT-000001/);
+    const row = await db.execute("SELECT status,amount,extracted_amount,amount_comparison,findings FROM treasury_submissions WHERE reference='IRPT-000001'");
+    assert.equal(row.rows[0].status, "PENDING");
+    assert.equal(Number(row.rows[0].extracted_amount), 5000);
+    assert.equal(row.rows[0].amount_comparison, "MATCH");
+    assert.deepEqual(JSON.parse(row.rows[0].findings), []);
+    const audit = await db.execute("SELECT action,new_status FROM treasury_audit_log WHERE reference='IRPT-000001'");
+    assert.equal(audit.rows[0].action, "SUBMITTED");
+    assert.equal(audit.rows[0].new_status, "PENDING");
+  } finally { globalThis.fetch = originalFetchHolder.value; await db.close(); }
+});
+
+test("amount checker replies MISMATCH and flags the submission for review", async () => {
+  const db = await openDb();
+  globalThis.fetch = async () => new Response(submissionPng, { status: 200, headers: { "content-length": String(submissionPng.length) } });
+  try {
+    const replies = await submitWithOcr(db, "Payer Alice_1 paid Amount: 3,000 to IRP Treasury", { amount: 5000 });
+    assert.match(replies[0], /🔴 Amount Mismatch/);
+    assert.match(replies[0], /Claimed amount: \$5,000/);
+    assert.match(replies[0], /Screenshot amount: \$3,000/);
+    assert.match(replies[0], /The amounts do not match\./);
+    assert.match(replies[0], /Status: Flagged for review\./);
+    assert.match(replies[0], /IRPT-000001/);
+    const row = await db.execute("SELECT status,extracted_amount,amount_comparison,findings FROM treasury_submissions WHERE reference='IRPT-000001'");
+    assert.equal(row.rows[0].status, "NEEDS_REVIEW");
+    assert.equal(Number(row.rows[0].extracted_amount), 3000);
+    assert.equal(row.rows[0].amount_comparison, "MISMATCH");
+    assert.ok(JSON.parse(row.rows[0].findings).includes("AMOUNT_MISMATCH"));
+  } finally { globalThis.fetch = originalFetchHolder.value; await db.close(); }
+});
+
+test("amount checker replies Unable to Read when OCR cannot identify an amount", async () => {
+  const db = await openDb();
+  globalThis.fetch = async () => new Response(submissionPng, { status: 200, headers: { "content-length": String(submissionPng.length) } });
+  try {
+    const replies = await submitWithOcr(db, "blurry screenshot, no readable text", { amount: 5000 });
+    assert.match(replies[0], /🟡 Unable to Read Amount/);
+    assert.match(replies[0], /Please submit a clearer screenshot\./);
+    assert.match(replies[0], /Status: Needs review\./);
+    assert.match(replies[0], /IRPT-000001/);
+    const row = await db.execute("SELECT status,extracted_amount,amount_comparison,findings FROM treasury_submissions WHERE reference='IRPT-000001'");
+    assert.equal(row.rows[0].status, "NEEDS_REVIEW");
+    assert.equal(row.rows[0].extracted_amount, null);
+    assert.equal(row.rows[0].amount_comparison, "NEEDS_REVIEW");
+    const findings = JSON.parse(row.rows[0].findings);
+    assert.ok(findings.includes("AMOUNT_NOT_READABLE"));
+    // Reviewers still see the advisory screenshot analysis and approve gating.
+    const audit = await db.execute("SELECT COUNT(*) count FROM treasury_audit_log WHERE reference='IRPT-000001'");
+    assert.equal(Number(audit.rows[0].count), 1);
+  } finally { globalThis.fetch = originalFetchHolder.value; await db.close(); }
+});
+
+test("OCR engine failures never break submission and degrade to NEEDS_REVIEW", async () => {
+  const db = await openDb();
+  globalThis.fetch = async () => new Response(submissionPng, { status: 200, headers: { "content-length": String(submissionPng.length) } });
+  try {
+    __setTreasuryOcrForTests(async () => { throw new Error("tesseract exploded"); });
+    const analysis = await analyzeReceipt(submissionPng, { payer: "Alice_1", amount: 5000 });
+    assert.equal(analysis.ocrText, "");
+    assert.equal(analysis.amountCheck.comparison, "NEEDS_REVIEW");
+    assert.match(analysis.hash, /^[a-f0-9]{64}$/);
+    __setTreasuryOcrForTests(async () => undefined);
+    const empty = await analyzeReceipt(submissionPng, { payer: "Alice_1", amount: 5000 });
+    assert.equal(empty.ocrText, "");
+    assert.equal(empty.amountCheck.comparison, "NEEDS_REVIEW");
+    const replies = await submitWithOcr(db, "Payer Alice_1 paid Amount: 5,000 to IRP Treasury", { amount: 5000 });
+    assert.match(replies[0], /🟢 Amount Match/);
+  } finally {
+    __setTreasuryOcrForTests(null);
+    globalThis.fetch = originalFetchHolder.value;
+    await db.close();
+  }
+});
+
+test("startup migration adds amount_comparison to legacy treasury tables", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ptb-treasury-legacy-")); dirs.push(dir);
+  const db = createClient({ url: `file:${join(dir, "legacy.db").replace(/\\/g, "/")}` });
+  const legacy = await readFile(new URL("../db/migrations/001_treasury.sql", import.meta.url), "utf8");
+  // Trigger statements span internal semicolons and are irrelevant to the
+  // column migration, so they are excluded from the naive split.
+  const statements = legacy.split(/\r?\n/)
+    .filter((line) => !/^\s*--/.test(line) && !/CREATE TRIGGER/i.test(line))
+    .join("\n")
+    .split(";")
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+  await db.batch(statements, "write");
+  try {
+    assert.equal(await ensureAmountComparisonColumn(db), true);
+    await db.execute({ sql: "INSERT INTO treasury_submissions (reference,submitter_id,payer_username,amount,purpose,attachment_url,attachment_name,screenshot_hash,status,amount_comparison) VALUES ('IRPT-000001','100','Alice',50,'Fee','https://example.test/a','a.png','abc','NEEDS_REVIEW','MISMATCH')" });
+    const row = await db.execute("SELECT amount_comparison FROM treasury_submissions WHERE reference='IRPT-000001'");
+    assert.equal(row.rows[0].amount_comparison, "MISMATCH");
+    assert.equal(await ensureAmountComparisonColumn(db), true);
+  } finally { await db.close(); }
 });
