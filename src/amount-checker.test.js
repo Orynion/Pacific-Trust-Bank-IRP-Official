@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AMOUNT_MISMATCH, AMOUNT_MATCH, AMOUNT_NEEDS_REVIEW, buildAmountCheckerMessage, checkScreenshotAmount, describeAmountComparison } from "./amount-checker.js";
+import { AMOUNT_MISMATCH, AMOUNT_MATCH, AMOUNT_NEEDS_REVIEW, buildAmountCheckerMessage, checkScreenshotAmount, describeAmountComparison, identifyPaymentScreen } from "./amount-checker.js";
 
 test("matching labelled amounts return MATCH for comma, plain, and space formatting", () => {
   for (const text of ["You paid $5,000 to IRP Treasury", "Amount: 5000", "Amount:\n5 000"]) {
@@ -41,6 +41,44 @@ test("a strong amount label beats other transaction wording nearby", () => {
   const check = checkScreenshotAmount("Total transferred: 4,500\nAmount paid: 3,000", 3000);
   assert.equal(check.comparison, AMOUNT_MATCH);
   assert.equal(check.extractedAmount, 3000);
+});
+
+test("wrapped labels and common payment-screen amount wording are recognized", () => {
+  for (const text of [
+    "Amount Paid\n$5,000\nPayment Successful",
+    "Amount sent: 5 000",
+    "You have successfully paid $5,000",
+    "Transaction Amount\n5,000",
+  ]) {
+    const check = checkScreenshotAmount(text, 5000);
+    assert.equal(check.comparison, AMOUNT_MATCH, text);
+    assert.equal(check.extractedAmount, 5000, text);
+  }
+});
+
+test("payment-screen identification requires transaction context and amount or recipient cues", () => {
+  assert.equal(identifyPaymentScreen("PAYMENT SUCCESSFUL\nAmount Paid\n$5,000\nSent to IRP Treasury"), true);
+  assert.equal(identifyPaymentScreen("Payer Alice paid IRP Treasury Amount: 500"), true);
+  assert.equal(identifyPaymentScreen("Balance: 5,000\nTransaction ID: TX-5000"), false);
+  assert.equal(identifyPaymentScreen("Payment method: card"), false);
+  assert.equal(identifyPaymentScreen(""), false);
+});
+
+test("in-game Info payment confirmations in varied screenshot crops identify the sent amount", () => {
+  const examples = [
+    "Info\nSuccessfully sent 8,000 € to L4RRY.\nOkay",
+    "Successfully sent 8,000 € to L4RRY.",
+    "Info Successfully sent 8,000 € to Chickenwings. Okay",
+    "Successfully sent 8,000 € to Halstead.",
+    "42.44k € 21:26\nInfo\nSuccessfully sent 8,000 € to L4RRY.\nOkay",
+  ];
+
+  for (const text of examples) {
+    const check = checkScreenshotAmount(text, 8000);
+    assert.equal(check.comparison, AMOUNT_MATCH, text);
+    assert.equal(check.extractedAmount, 8000, text);
+    assert.equal(identifyPaymentScreen(text), true, text);
+  }
 });
 
 test("multiple contradicting labelled amounts stay unresolved (NEEDS_REVIEW)", () => {

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { inflateSync } from "node:zlib";
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, EmbedBuilder, MessageFlags, ModalBuilder, PermissionFlagsBits, TextInputBuilder, TextInputStyle } from "discord.js";
-import { AMOUNT_MISMATCH, AMOUNT_NEEDS_REVIEW, buildAmountCheckerMessage, checkScreenshotAmount, describeAmountComparison } from "./amount-checker.js";
+import { AMOUNT_MISMATCH, AMOUNT_NEEDS_REVIEW, buildAmountCheckerMessage, checkScreenshotAmount, describeAmountComparison, identifyPaymentScreen } from "./amount-checker.js";
 
 export const TREASURY_STATUSES = ["PENDING", "NEEDS_REVIEW", "VERIFIED", "REJECTED", "DUPLICATE"];
 export const treasurySchemaStatements = [
@@ -102,9 +102,16 @@ export function treasuryReviewer(interaction, roleIds = "") {
 
 export function inspectReceiptText(text, { payer, amount } = {}) {
   const normalized = String(text ?? "").replace(/\s+/g, " ").trim();
-  const lower = normalized.toLowerCase();
-  const payerMatch = payer && lower.includes(payer.toLowerCase());
+  const payerMatch = payer && new RegExp(
+    String.raw`\b(?:payer|sender|sent\s+by|from)\s*[:#-]?\s*${String(payer).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9_])`,
+    "i",
+  ).test(normalized);
   const recipientMatch = /\b(irp\s*treasury|treasury)\b/i.test(normalized);
+  const confirmationRecipient = normalized.match(
+    /\b(?:successfully\s+)?(?:sent|transferred|paid)\s+(?:[$€£]\s*)?\d[\d., \u00a0]*(?:\s*[$€£])?\s+to\s+([A-Za-z0-9_][A-Za-z0-9_.-]{0,19})\b/i,
+  )?.[1] ?? null;
+  const extractedRecipient = recipientMatch ? "IRP Treasury" : confirmationRecipient;
+  const paymentScreenDetected = identifyPaymentScreen(text);
   // Amount checker: only transaction-labelled numbers may become the extracted
   // amount; anything unreadable or ambiguous is recorded as NEEDS_REVIEW.
   const amountCheck = checkScreenshotAmount(text, amount);
@@ -113,10 +120,10 @@ export function inspectReceiptText(text, { payer, amount } = {}) {
   const findings = [];
   if (!normalized) findings.push("OCR_UNAVAILABLE_OR_UNREADABLE");
   if (!payerMatch) findings.push(normalized ? "PAYER_NOT_CONFIRMED_BY_OCR" : "PAYER_NOT_READABLE");
-  if (!recipientMatch) findings.push("RECIPIENT_NOT_CONFIRMED_BY_OCR");
+  if (!recipientMatch) findings.push(extractedRecipient ? "RECIPIENT_NOT_IRP_TREASURY" : "RECIPIENT_NOT_CONFIRMED_BY_OCR");
   if (amountCheck.comparison === AMOUNT_MISMATCH) findings.push("AMOUNT_MISMATCH");
   else if (amountCheck.comparison === AMOUNT_NEEDS_REVIEW) findings.push("AMOUNT_NOT_READABLE");
-  return { extractedPayer: payerMatch ? payer : null, extractedRecipient: recipientMatch ? "IRP Treasury" : null, extractedAmount, transactionId, findings, amountCheck };
+  return { extractedPayer: payerMatch ? payer : null, extractedRecipient, extractedAmount, transactionId, findings, amountCheck, paymentScreenDetected };
 }
 
 function defaultRunOcr(bytes) {
@@ -125,8 +132,18 @@ function defaultRunOcr(bytes) {
   // non-default binary location (for example a Windows install or a Bothost
   // container path).
   const command = process.env.TESSERACT_PATH || "tesseract";
-  const result = spawnSync(command, ["stdin", "stdout", "--psm", "6"], { input: bytes, encoding: "utf8", timeout: 8_000, maxBuffer: 128 * 1024 });
-  return result.status === 0 ? result.stdout.trim() : "";
+  const results = [];
+  for (const pageSegmentationMode of [6, 11]) {
+    const result = spawnSync(command, ["stdin", "stdout", "--psm", String(pageSegmentationMode), "-c", "user_defined_dpi=300"], { input: bytes, encoding: "utf8", timeout: 8_000, maxBuffer: 128 * 1024 });
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      const detail = String(result.stderr ?? "").trim().slice(0, 500);
+      throw new Error(`Tesseract OCR failed in page segmentation mode ${pageSegmentationMode}${detail ? `: ${detail}` : ""}`);
+    }
+    const text = String(result.stdout ?? "").trim();
+    if (text) results.push(text);
+  }
+  return [...new Set(results.flatMap((text) => text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)))].join("\n");
 }
 
 // Test-only OCR engine override so the submission flow can be tested without
@@ -228,7 +245,7 @@ function makeReviewEmbed(row) {
     .setTitle(`Treasury receipt ${row.reference}`)
     .setDescription(`**Status:** ${row.status}\n**Claimed payer:** ${row.payer_username}\n**Claimed amount:** ${Number(row.amount).toLocaleString()}\n**Purpose:** ${row.purpose}\n**Submitter:** <@${row.submitter_id}>`)
     .addFields(
-      { name: "Screenshot analysis (assessment only)", value: `Payer: ${row.extracted_payer ?? "not confirmed"}\nRecipient: ${row.extracted_recipient ?? "not confirmed"}\nAmount: ${row.extracted_amount ?? "not readable"}\nAmount comparison: ${describeAmountComparison(row.amount_comparison)}\nTransaction ID: ${row.transaction_id ?? "not found"}` },
+      { name: "Screenshot analysis (assessment only)", value: `Payment screen: ${identifyPaymentScreen(row.ocr_text) ? "detected" : "not confidently identified"}\nPayer: ${row.extracted_payer ?? "not confirmed"}\nRecipient: ${row.extracted_recipient ?? "not confirmed"}\nAmount: ${row.extracted_amount ?? "not readable"}\nAmount comparison: ${describeAmountComparison(row.amount_comparison)}\nTransaction ID: ${row.transaction_id ?? "not found"}` },
       { name: "Automated findings", value: findings.length ? findings.join(", ") : "No discrepancies detected; image analysis does not prove transfer authenticity." },
       ...(row.duplicate_of ? [{ name: "Duplicate match", value: `Related receipt: ${row.duplicate_of}` }] : []),
     ).setImage(row.attachment_url).setFooter({ text: "Screenshot-assisted review; authorized human approval is required." });
@@ -358,6 +375,7 @@ export async function handleDepositTicketImage(db, message) {
         args: [ticket.id, message.author.id, analysis.hash, analysis.perceptualHash, attachment.url, analysis.ocrText, analysis.extractedPayer, analysis.extractedRecipient, analysis.extractedAmount, JSON.stringify(findings), related ?? visualMatch?.reference ?? null],
       });
       const checks = [
+        `Payment screen: ${analysis.paymentScreenDetected ? "detected from OCR cues" : "not confidently identified"}`,
         `Payer (${claimedPayer || "account has no linked Roblox name"}): ${analysis.extractedPayer ? "matched" : "not confirmed by OCR"}`,
         `Recipient: ${analysis.extractedRecipient ?? "not confirmed by OCR"}`,
         `Amount: ${analysis.extractedAmount ?? "not readable"}${analysis.amountCheck?.comparison === "MATCH" ? " (matches ticket amount)" : analysis.extractedAmount !== null && analysis.extractedAmount !== Number(ticket.amount) ? ` (ticket claims ${Number(ticket.amount).toLocaleString()})` : ""}`,

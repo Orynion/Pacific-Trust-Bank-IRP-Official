@@ -23,10 +23,28 @@ const ADMIN = { memberPermissions: { has: (flag) => flag === PermissionFlagsBits
 test("OCR findings identify amount mismatch and unreadable screenshots as review-only", () => {
   const mismatch = inspectReceiptText("Payer Alice paid IRP Treasury Amount: 500", { payer: "Alice", amount: 400 });
   assert.equal(mismatch.extractedAmount, 500);
+  assert.equal(mismatch.paymentScreenDetected, true);
   assert.ok(mismatch.findings.includes("AMOUNT_MISMATCH"));
   const unreadable = inspectReceiptText("", { payer: "Alice", amount: 400 });
+  assert.equal(unreadable.paymentScreenDetected, false);
   assert.ok(unreadable.findings.includes("OCR_UNAVAILABLE_OR_UNREADABLE"));
   assert.ok(unreadable.findings.includes("AMOUNT_NOT_READABLE"));
+});
+
+test("in-game Info screens extract the recipient without misidentifying them as the payer", () => {
+  for (const [screenText, recipient] of [
+    ["Info\nSuccessfully sent 8,000 € to L4RRY.\nOkay", "L4RRY"],
+    ["Successfully sent 8,000 € to Chickenwings.", "Chickenwings"],
+    ["Successfully sent 8,000 € to Halstead.", "Halstead"],
+  ]) {
+    const check = inspectReceiptText(screenText, { payer: "Alice_1", amount: 8000 });
+    assert.equal(check.paymentScreenDetected, true, screenText);
+    assert.equal(check.extractedRecipient, recipient, screenText);
+    assert.equal(check.extractedPayer, null, screenText);
+    assert.equal(check.extractedAmount, 8000, screenText);
+    assert.ok(check.findings.includes("RECIPIENT_NOT_IRP_TREASURY"));
+    assert.ok(check.findings.includes("PAYER_NOT_CONFIRMED_BY_OCR"));
+  }
 });
 
 test("permission checks allow only configured roles and administrators", () => {
@@ -108,6 +126,7 @@ test("first image in a pending deposit ticket gets an advisory detection report"
   const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/pZ8AAAAASUVORK5CYII=", "base64");
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(png, { status: 200, headers: { "content-length": String(png.length) } });
+  __setTreasuryOcrForTests(async () => "Payment Successful\nAmount paid: 500\nRecipient: IRP Treasury\nPayer: Alice_1");
   let sent;
   try {
     const message = {
@@ -117,9 +136,12 @@ test("first image in a pending deposit ticket gets an advisory detection report"
     };
     assert.equal(await handleDepositTicketImage(db, message), true);
     assert.match(sent.embeds[0].data.title, /Experimental receipt detection/);
-    const saved = await db.execute("SELECT ticket_id,extracted_amount FROM treasury_ticket_receipt_checks");
+    assert.match(sent.embeds[0].data.fields[0].value, /Payment screen: detected from OCR cues/);
+    assert.match(sent.embeds[0].data.fields[0].value, /Amount: 500 \(matches ticket amount\)/);
+    const saved = await db.execute("SELECT ticket_id,extracted_amount,ocr_text FROM treasury_ticket_receipt_checks");
     assert.equal(Number(saved.rows[0].ticket_id), 7);
-  } finally { globalThis.fetch = originalFetch; await db.close(); }
+    assert.match(saved.rows[0].ocr_text, /Payment Successful/);
+  } finally { __setTreasuryOcrForTests(null); globalThis.fetch = originalFetch; await db.close(); }
 });
 
 const submissionPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/pZ8AAAAASUVORK5CYII=", "base64");

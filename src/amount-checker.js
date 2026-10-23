@@ -28,7 +28,7 @@ export const AMOUNT_COMPARISON_VALUES = [AMOUNT_MATCH, AMOUNT_MISMATCH, AMOUNT_N
 const maxSupportedAmount = 2_147_483_647;
 
 // Label wording that explicitly denotes the transaction amount.
-const TIER1_LABEL = /\b(?:amount|paid|payment|pay)\b/i;
+const TIER1_LABEL = /\b(?:amount|paid|payment|pay|amount\s+(?:sent|paid|transferred)|(?:sent|transferred)\s+amount)\b/i;
 // Other transaction wording that contextually denotes a money figure.
 const TIER2_LABEL = /\b(?:total|transfers?|transferred|sents?|deposits?|deposited|debits?|debited|charged|charge|deducts?|deducted|purchases?|purchased)\b/i;
 // Context that marks a nearby number as NOT the transaction amount. Checked
@@ -41,6 +41,20 @@ const excludeWithinChars = 14;
 // $5,000 / €3,000 / "12 500" / "5.000" style tokens. The separator run also
 // tolerates OCR spacing variations such as "5, 000".
 const candidatePattern = /(?:[$€£]\s*)?\d+(?:[ \u00A0.,]+\d+)*/g;
+
+export function identifyPaymentScreen(ocrText) {
+  const text = String(ocrText ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+
+  const hasPaymentAction = /\b(?:paid|payment|pay|sent|transfer(?:red)?)\b/i.test(text);
+  const hasCompletion = /\b(?:success(?:ful(?:ly)?)?|complete(?:d)?|sent|paid|transferred)\b/i.test(text);
+  const hasAmount = /\b(?:amount|total|paid|sent|transferred)\b|[$€£]\s*\d/i.test(text);
+  const hasRecipient = /\b(?:to|recipient|receiver|beneficiary)\b/i.test(text);
+  const hasTreasuryRecipient = /\b(?:irp\s*treasury|treasury)\b/i.test(text);
+
+  return (hasPaymentAction && hasCompletion && (hasAmount || hasRecipient))
+    || (hasPaymentAction && hasAmount && (hasRecipient || hasTreasuryRecipient));
+}
 
 function parseAmountToken(token) {
   const cleaned = token.replace(/[$€£]/g, " ").trim().replace(/^[^\d]+|[^\d]+$/g, "");
