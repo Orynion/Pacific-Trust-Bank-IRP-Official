@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { inflateSync } from "node:zlib";
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, EmbedBuilder, MessageFlags, ModalBuilder, PermissionFlagsBits, TextInputBuilder, TextInputStyle } from "discord.js";
 import { AMOUNT_MISMATCH, AMOUNT_NEEDS_REVIEW, buildAmountCheckerMessage, checkScreenshotAmount, describeAmountComparison, identifyPaymentScreen } from "./amount-checker.js";
@@ -126,23 +126,72 @@ export function inspectReceiptText(text, { payer, amount } = {}) {
   return { extractedPayer: payerMatch ? payer : null, extractedRecipient, extractedAmount, transactionId, findings, amountCheck, paymentScreenDetected };
 }
 
-function defaultRunOcr(bytes) {
+function runTesseract(bytes, command, pageSegmentationMode) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, ["stdin", "stdout", "--psm", String(pageSegmentationMode), "-c", "user_defined_dpi=300"], { stdio: ["pipe", "pipe", "pipe"] });
+    const stdout = [];
+    const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const finish = (error, text = "") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve(text.trim());
+    };
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(new Error(`Tesseract OCR timed out in page segmentation mode ${pageSegmentationMode}`));
+    }, 8_000);
+    timeout.unref?.();
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > 128 * 1024) {
+        child.kill("SIGKILL");
+        finish(new Error(`Tesseract OCR output exceeded the limit in page segmentation mode ${pageSegmentationMode}`));
+        return;
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderrBytes >= 2 * 1024) return;
+      const remaining = 2 * 1024 - stderrBytes;
+      const part = chunk.subarray(0, remaining);
+      stderrBytes += part.length;
+      stderr.push(part);
+    });
+    child.once("error", (error) => finish(error));
+    child.once("close", (code) => {
+      if (code !== 0) {
+        const detail = Buffer.concat(stderr).toString("utf8").trim().slice(0, 500);
+        finish(new Error(`Tesseract OCR failed in page segmentation mode ${pageSegmentationMode}${detail ? `: ${detail}` : ""}`));
+        return;
+      }
+      finish(null, Buffer.concat(stdout).toString("utf8"));
+    });
+    child.stdin.once("error", () => {});
+    child.stdin.end(bytes);
+  });
+}
+
+async function defaultRunOcr(bytes) {
   // Tesseract is optional and local. Its output is a review hint only; absence
   // or failure must never reject a receipt. TESSERACT_PATH can point at a
   // non-default binary location (for example a Windows install or a Bothost
   // container path).
   const command = process.env.TESSERACT_PATH || "tesseract";
-  const results = [];
-  for (const pageSegmentationMode of [6, 11]) {
-    const result = spawnSync(command, ["stdin", "stdout", "--psm", String(pageSegmentationMode), "-c", "user_defined_dpi=300"], { input: bytes, encoding: "utf8", timeout: 8_000, maxBuffer: 128 * 1024 });
-    if (result.error) throw result.error;
-    if (result.status !== 0) {
-      const detail = String(result.stderr ?? "").trim().slice(0, 500);
-      throw new Error(`Tesseract OCR failed in page segmentation mode ${pageSegmentationMode}${detail ? `: ${detail}` : ""}`);
+  const passes = await Promise.all([6, 11].map(async (pageSegmentationMode) => {
+    try {
+      return await runTesseract(bytes, command, pageSegmentationMode);
+    } catch (error) {
+      return { error };
     }
-    const text = String(result.stdout ?? "").trim();
-    if (text) results.push(text);
-  }
+  }));
+  const results = passes.filter((pass) => typeof pass === "string" && pass);
+  const failures = passes.filter((pass) => pass?.error);
+  if (!results.length && failures.length) throw failures[0].error;
   return [...new Set(results.flatMap((text) => text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)))].join("\n");
 }
 
@@ -156,7 +205,7 @@ export function __setTreasuryOcrForTests(override) {
 export async function analyzeReceipt(bytes, claimed) {
   let ocrText = "";
   try {
-    ocrText = String((ocrEngineOverride ? await ocrEngineOverride(bytes) : defaultRunOcr(bytes)) ?? "").trim();
+    ocrText = String((ocrEngineOverride ? await ocrEngineOverride(bytes) : await defaultRunOcr(bytes)) ?? "").trim();
   } catch (error) {
     console.warn("PTB treasury OCR failed:", error?.message ?? String(error));
   }
@@ -245,7 +294,7 @@ function makeReviewEmbed(row) {
     .setTitle(`Treasury receipt ${row.reference}`)
     .setDescription(`**Status:** ${row.status}\n**Claimed payer:** ${row.payer_username}\n**Claimed amount:** ${Number(row.amount).toLocaleString()}\n**Purpose:** ${row.purpose}\n**Submitter:** <@${row.submitter_id}>`)
     .addFields(
-      { name: "Screenshot analysis (assessment only)", value: `Payment screen: ${identifyPaymentScreen(row.ocr_text) ? "detected" : "not confidently identified"}\nPayer: ${row.extracted_payer ?? "not confirmed"}\nRecipient: ${row.extracted_recipient ?? "not confirmed"}\nAmount: ${row.extracted_amount ?? "not readable"}\nAmount comparison: ${describeAmountComparison(row.amount_comparison)}\nTransaction ID: ${row.transaction_id ?? "not found"}` },
+      { name: "Screenshot analysis (assessment only)", value: `Payment screen: ${identifyPaymentScreen(row.ocr_text) ? "detected" : "not confidently identified"}\nSender / payer: ${row.extracted_payer ?? "not confirmed from explicit sender text"}\nRecipient (shown after “to”): ${row.extracted_recipient ?? "not confirmed"}\nSent amount (including € value): ${row.extracted_amount ?? "not readable"}\nAmount comparison: ${describeAmountComparison(row.amount_comparison)}\nTransaction ID: ${row.transaction_id ?? "not found"}` },
       { name: "Automated findings", value: findings.length ? findings.join(", ") : "No discrepancies detected; image analysis does not prove transfer authenticity." },
       ...(row.duplicate_of ? [{ name: "Duplicate match", value: `Related receipt: ${row.duplicate_of}` }] : []),
     ).setImage(row.attachment_url).setFooter({ text: "Screenshot-assisted review; authorized human approval is required." });
@@ -376,9 +425,9 @@ export async function handleDepositTicketImage(db, message) {
       });
       const checks = [
         `Payment screen: ${analysis.paymentScreenDetected ? "detected from OCR cues" : "not confidently identified"}`,
-        `Payer (${claimedPayer || "account has no linked Roblox name"}): ${analysis.extractedPayer ? "matched" : "not confirmed by OCR"}`,
-        `Recipient: ${analysis.extractedRecipient ?? "not confirmed by OCR"}`,
-        `Amount: ${analysis.extractedAmount ?? "not readable"}${analysis.amountCheck?.comparison === "MATCH" ? " (matches ticket amount)" : analysis.extractedAmount !== null && analysis.extractedAmount !== Number(ticket.amount) ? ` (ticket claims ${Number(ticket.amount).toLocaleString()})` : ""}`,
+        `Sender / payer (${claimedPayer || "account has no linked Roblox name"}): ${analysis.extractedPayer ? "matched from explicit sender text" : "not confirmed by OCR"}`,
+        `Recipient (shown after “to”): ${analysis.extractedRecipient ?? "not confirmed by OCR"}`,
+        `Sent amount (including € value): ${analysis.extractedAmount ?? "not readable"}${analysis.amountCheck?.comparison === "MATCH" ? " (matches ticket amount)" : analysis.extractedAmount !== null && analysis.extractedAmount !== Number(ticket.amount) ? ` (ticket claims ${Number(ticket.amount).toLocaleString()})` : ""}`,
         `Duplicate: ${related ? `exact match to ${related}` : visualMatch ? `visually similar to ${visualMatch.reference ?? "a prior receipt"}` : "no exact or visual match found"}`,
         `Findings: ${findings.length ? findings.join(", ") : "No OCR discrepancy detected"}`,
       ];
