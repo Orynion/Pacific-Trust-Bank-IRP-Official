@@ -171,8 +171,9 @@ export async function processDueCharges(db, now = new Date(), client = null) {
   });
   let processed = 0;
   for (const charge of due.rows) {
-    const tx = await db.transaction("write");
+    let tx;
     try {
+      tx = await db.transaction("write");
       const claimed = await tx.execute({
         sql: "UPDATE recurring_charges SET next_due_at = ? WHERE id = ? AND active = 1 AND next_due_at = ?",
         args: [addInterval(new Date(charge.next_due_at), charge.interval), charge.id, charge.next_due_at],
@@ -197,10 +198,10 @@ export async function processDueCharges(db, now = new Date(), client = null) {
       // Fail closed for this occurrence (it is retried on the next run) and
       // keep processing the remaining due charges instead of aborting the
       // whole sweep, which would starve every charge queued behind it.
-      await tx.rollback().catch(() => {});
+      await tx?.rollback().catch(() => {});
       console.error(`PTB recurring charge #${charge.id} processing failed:`, error);
     } finally {
-      tx.close();
+      tx?.close();
     }
   }
   return processed;

@@ -14,6 +14,7 @@ import {
   Routes,
   SlashCommandBuilder,
 } from "discord.js";
+import { acknowledgeWithinDeadline, respond } from "./interaction-responder.js";
 import { getTransactionHistory, handleHistoryButton } from "./transaction-history.js";
 import { handleBillCommand, processDueCharges, recurringChargeSchemaStatements, sendDueChargeReminders } from "./recurring-charges.js";
 import {
@@ -66,9 +67,29 @@ healthServer.listen(port, "0.0.0.0", () => {
 });
 
 const dbUrl = process.env.TURSO_URL || "file:ptb-local.db";
+
+// Increase the default connect timeout for remote Turso databases.
+// Node's built-in fetch (undici) defaults to a 10 s connect timeout. On
+// high-latency paths to Turso's ap-south-1 endpoint this often expires with
+// UND_ERR_CONNECT_TIMEOUT before the TLS handshake completes. A 15 s ceiling
+// reduces false failures without masking genuine outages.
+let tursoFetchDispatcher;
+if (dbUrl && !dbUrl.startsWith("file:")) {
+  try {
+    const { Agent } = await import("undici");
+    tursoFetchDispatcher = new Agent({ connect: { timeout: 15_000 } });
+    console.log("[PTB Info] Turso fetch connect timeout set to 15 000 ms.");
+  } catch {
+    console.warn("[PTB Info] Could not load undici; using default fetch connect timeout.");
+  }
+}
+
 const db = createClient({
   url: dbUrl,
   authToken: process.env.TURSO_AUTH_TOKEN || undefined,
+  ...(tursoFetchDispatcher
+    ? { fetch: (input, init) => globalThis.fetch(input, { ...init, dispatcher: tursoFetchDispatcher }) }
+    : {}),
 });
 
 const pingCommand = new SlashCommandBuilder()
@@ -232,14 +253,14 @@ function createHelpEmbed(isAdministrator) {
 
 async function handleHelp(interaction) {
   const isAdministrator = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ?? false;
-  await interaction.reply({
+  await respond(interaction, {
     embeds: [createHelpEmbed(isAdministrator)],
     ...ephemeralReply,
   });
 }
 
 async function handleTransactionHistory(interaction) {
-  await interaction.reply(await getTransactionHistory(db, interaction.user.id, 0));
+  await respond(interaction, await getTransactionHistory(db, interaction.user.id, 0));
 }
 
 async function handleRegister(interaction) {
@@ -411,22 +432,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try { await handleTicketCloseModal(db, interaction); }
     catch (error) {
       console.error("PTB ticket close modal failed:", error);
-      const reply = { content: "I could not close this ticket right now. It keeps its current state, so you can safely retry.", ...ephemeralReply };
-      if (interaction.replied || interaction.deferred) await interaction.followUp(reply).catch(() => {});
-      else await interaction.reply(reply).catch(() => {});
+      // Same strategy everywhere: reply if untouched, edit the deferred
+      // response if pending, follow up once the first response was sent.
+      await respond(interaction, { content: "I could not close this ticket right now. It keeps its current state, so you can safely retry.", ...ephemeralReply })
+        .catch((replyError) => console.error("Could not send ticket close error reply:", replyError));
     }
     return;
   }
   if (interaction.isModalSubmit() && interaction.customId.startsWith("trm-")) {
     try { await handleTreasuryModal(db, interaction, TREASURY_REVIEW_ROLES); }
-    catch (error) { console.error("PTB treasury modal failed:", error); await interaction.reply({ content: "I could not process that treasury review action.", ...ephemeralReply }).catch(() => {}); }
+    catch (error) {
+      console.error("PTB treasury modal failed:", error);
+      await respond(interaction, { content: "I could not process that treasury review action.", ...ephemeralReply })
+        .catch((replyError) => console.error("Could not send treasury modal error reply:", replyError));
+    }
     return;
   }
   if (interaction.isButton()) {
     const treasuryMatch = interaction.customId.match(/^trv-(approve|approve-confirm|reject|info|flag):(IRPT-\d+)$/);
     if (treasuryMatch) {
       try { await handleTreasuryButton(db, interaction, treasuryMatch[1], treasuryMatch[2], TREASURY_REVIEW_ROLES); }
-      catch (error) { console.error("PTB treasury review failed:", error); await interaction.reply({ content: "I could not process that treasury review action.", ...ephemeralReply }).catch(() => {}); }
+      catch (error) {
+        console.error("PTB treasury review failed:", error);
+        await respond(interaction, { content: "I could not process that treasury review action.", ...ephemeralReply })
+          .catch((replyError) => console.error("Could not send treasury button error reply:", replyError));
+      }
       return;
     }
     const ticketDecisionMatch = interaction.customId.match(/^tkt-(approve|complete|reject):(\d+)$/);
@@ -435,19 +465,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleTicketDecision(db, interaction, ticketDecisionMatch[1], ticketDecisionMatch[2]);
       } catch (error) {
         console.error("PTB ticket action failed:", error);
-        const reply = {
+        await respond(interaction, {
           content: "I could not process that ticket action right now. The ticket keeps its recorded state, so retrying the same action is safe.",
           ...ephemeralReply,
-        };
-        if (interaction.replied || interaction.deferred) {
-          await interaction.followUp(reply).catch((replyError) => {
-            console.error("Could not send ticket action error reply:", replyError);
-          });
-        } else {
-          await interaction.reply(reply).catch((replyError) => {
-            console.error("Could not send ticket action error reply:", replyError);
-          });
-        }
+        }).catch((replyError) => {
+          console.error("Could not send ticket action error reply:", replyError);
+        });
       }
       return;
     }
@@ -456,12 +479,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (ticketCloseMatch) {
       await handleTicketCloseRequest(db, interaction, ticketCloseMatch[1], ticketCloseMatch[2] ?? null).catch(async (error) => {
         console.error("PTB ticket close button failed:", error);
-        const reply = { content: "I could not close this ticket right now. It keeps its current state, so you can safely retry.", ...ephemeralReply };
-        if (interaction.replied || interaction.deferred) {
-          await interaction.followUp(reply).catch(() => {});
-        } else {
-          await interaction.reply(reply).catch(() => {});
-        }
+        await respond(interaction, { content: "I could not close this ticket right now. It keeps its current state, so you can safely retry.", ...ephemeralReply })
+          .catch((replyError) => console.error("Could not send ticket close error reply:", replyError));
       });
       return;
     }
@@ -474,7 +493,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     try {
-      await interaction.reply({
+      await respond(interaction, {
         content: "That button is no longer available.",
         ...ephemeralReply,
       });
@@ -485,80 +504,82 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
   if (!interaction.isChatInputCommand()) return;
   try {
-    if (interaction.commandName !== "register" && interaction.commandName !== "unregister" &&
-        interaction.commandName !== "add-user" &&
-        !["treasury-search", "treasury-report", "treasury-total"].includes(interaction.commandName)) {
-      const accountResult = await db.execute({
-        sql: "SELECT 1 FROM accounts WHERE discord_id = ? AND roblox_id IS NOT NULL LIMIT 1",
-        args: [interaction.user.id],
-      });
-      if (!accountResult.rows.length) {
-        await interaction.reply({
-          content: "You need to run `/register` before using PTB commands.",
-          ...ephemeralReply,
-        });
-        return;
-      }
-    }
-
-    if (interaction.commandName === "help") {
-      await handleHelp(interaction);
-    } else if (interaction.commandName === "ping") {
-      await interaction.reply("pong");
-    } else if (interaction.commandName === "register") {
-      await handleRegister(interaction);
-    } else if (interaction.commandName === "unregister") {
-      await handleUnregister(interaction);
-    } else if (interaction.commandName === "balance") {
-      await handleBalance(db, interaction);
-    } else if (interaction.commandName === "transaction" && interaction.options.getSubcommand() === "history") {
-      await handleTransactionHistory(interaction);
-    } else if (interaction.commandName === "deposit") {
-      await handleMoneyRequest(db, interaction, "deposit");
-    } else if (interaction.commandName === "withdraw") {
-      await handleMoneyRequest(db, interaction, "withdraw");
-    } else if (interaction.commandName === "add-user") {
-      await handleAddUser(db, interaction, ticketConfig().staffRoleIds);
-    } else if (interaction.commandName === "add-balance") {
-      await handleAddBalance(db, interaction);
-    } else if (interaction.commandName === "transfer") {
-      await handleTransfer(db, interaction);
-    } else if (interaction.commandName === "bill" || interaction.commandName === "tax") {
-      await handleBillCommand(db, interaction, interaction.commandName);
-    } else if (interaction.commandName === "treasury-submit") {
-      await submitTreasuryPayment(db, interaction, { reviewChannelId: process.env.TREASURY_REVIEW_CHANNEL_ID, reviewerRoleIds: TREASURY_REVIEW_ROLES });
-    } else if (interaction.commandName === "treasury-status") {
-      await handleTreasuryStatus(db, interaction, interaction.options.getString("reference", true));
-    } else if (interaction.commandName === "treasury-history") {
-      await handleTreasuryHistory(db, interaction);
-    } else if (interaction.commandName === "treasury-search") {
-      await handleTreasurySearch(db, interaction, TREASURY_REVIEW_ROLES, interaction.options.getString("query", true));
-    } else if (interaction.commandName === "treasury-report") {
-      const from = interaction.options.getString("from");
-      const to = interaction.options.getString("to");
-      const validDate = (value) => !value || (/^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)));
-      if (!validDate(from) || !validDate(to) || (from && to && from > to)) await interaction.reply({ content: "Use valid dates in YYYY-MM-DD format, with from on or before to.", ...ephemeralReply });
-      else await handleTreasuryReport(db, interaction, TREASURY_REVIEW_ROLES, { from, to });
-    } else if (interaction.commandName === "treasury-total") {
-      await handleTreasuryTotal(db, interaction, TREASURY_REVIEW_ROLES);
-    }
+    // Acknowledge within Discord's ~3s initial-response deadline even if the
+    // registration check or the command's own database work is slow. On the
+    // fast path nothing extra happens; on the slow path the interaction is
+    // deferred (ephemerally) and made deferral-safe, so every reply() below
+    // turns into editReply() and no handler sees "Unknown interaction".
+    await acknowledgeWithinDeadline(interaction, () => runChatCommand(interaction), { deferOptions: ephemeralReply });
   } catch (error) {
     console.error(`Command /${interaction.commandName} failed:`, error);
-    const reply = {
+    await respond(interaction, {
       content: "I could not complete that request right now. Please try again shortly.",
       ...ephemeralReply,
-    };
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp(reply).catch((replyError) => {
-        console.error("Could not send command error reply:", replyError);
-      });
-    } else {
-      await interaction.reply(reply).catch((replyError) => {
-        console.error("Could not send command error reply:", replyError);
-      });
-    }
+    }).catch((replyError) => {
+      console.error("Could not send command error reply:", replyError);
+    });
   }
 });
+
+async function runChatCommand(interaction) {
+  if (interaction.commandName !== "register" && interaction.commandName !== "unregister" &&
+      interaction.commandName !== "add-user" &&
+      !["treasury-search", "treasury-report", "treasury-total"].includes(interaction.commandName)) {
+    const accountResult = await db.execute({
+      sql: "SELECT 1 FROM accounts WHERE discord_id = ? AND roblox_id IS NOT NULL LIMIT 1",
+      args: [interaction.user.id],
+    });
+    if (!accountResult.rows.length) {
+      await respond(interaction, {
+        content: "You need to run `/register` before using PTB commands.",
+        ...ephemeralReply,
+      });
+      return;
+    }
+  }
+
+  if (interaction.commandName === "help") {
+    await handleHelp(interaction);
+  } else if (interaction.commandName === "ping") {
+    await respond(interaction, "pong");
+  } else if (interaction.commandName === "register") {
+    await handleRegister(interaction);
+  } else if (interaction.commandName === "unregister") {
+    await handleUnregister(interaction);
+  } else if (interaction.commandName === "balance") {
+    await handleBalance(db, interaction);
+  } else if (interaction.commandName === "transaction" && interaction.options.getSubcommand() === "history") {
+    await handleTransactionHistory(interaction);
+  } else if (interaction.commandName === "deposit") {
+    await handleMoneyRequest(db, interaction, "deposit");
+  } else if (interaction.commandName === "withdraw") {
+    await handleMoneyRequest(db, interaction, "withdraw");
+  } else if (interaction.commandName === "add-user") {
+    await handleAddUser(db, interaction, ticketConfig().staffRoleIds);
+  } else if (interaction.commandName === "add-balance") {
+    await handleAddBalance(db, interaction);
+  } else if (interaction.commandName === "transfer") {
+    await handleTransfer(db, interaction);
+  } else if (interaction.commandName === "bill" || interaction.commandName === "tax") {
+    await handleBillCommand(db, interaction, interaction.commandName);
+  } else if (interaction.commandName === "treasury-submit") {
+    await submitTreasuryPayment(db, interaction, { reviewChannelId: process.env.TREASURY_REVIEW_CHANNEL_ID, reviewerRoleIds: TREASURY_REVIEW_ROLES });
+  } else if (interaction.commandName === "treasury-status") {
+    await handleTreasuryStatus(db, interaction, interaction.options.getString("reference", true));
+  } else if (interaction.commandName === "treasury-history") {
+    await handleTreasuryHistory(db, interaction);
+  } else if (interaction.commandName === "treasury-search") {
+    await handleTreasurySearch(db, interaction, TREASURY_REVIEW_ROLES, interaction.options.getString("query", true));
+  } else if (interaction.commandName === "treasury-report") {
+    const from = interaction.options.getString("from");
+    const to = interaction.options.getString("to");
+    const validDate = (value) => !value || (/^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)));
+    if (!validDate(from) || !validDate(to) || (from && to && from > to)) await respond(interaction, { content: "Use valid dates in YYYY-MM-DD format, with from on or before to.", ...ephemeralReply });
+    else await handleTreasuryReport(db, interaction, TREASURY_REVIEW_ROLES, { from, to });
+  } else if (interaction.commandName === "treasury-total") {
+    await handleTreasuryTotal(db, interaction, TREASURY_REVIEW_ROLES);
+  }
+}
 
 try {
   await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements], "write");
