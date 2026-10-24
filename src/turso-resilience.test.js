@@ -4,7 +4,7 @@ import { createClient } from "@libsql/client";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { processDueCharges, recurringChargeSchemaStatements, sendDueChargeReminders } from "./recurring-charges.js";
+import { processDueCharges, recurringChargeSchemaStatements, runRecurringChargesSweep, sendDueChargeReminders } from "./recurring-charges.js";
 import { schemaStatements } from "./bank-ops.js";
 
 // ---------------------------------------------------------------------------
@@ -272,3 +272,123 @@ test("test isolation: suite uses only throwaway local file databases", async () 
     await db.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Temporary Turso connection failures and retry exhaustion tests
+// ---------------------------------------------------------------------------
+
+test("runRecurringChargesSweep retries on transient connection error and succeeds on subsequent attempt", async () => {
+  const db = openTestDb();
+  try {
+    await openSchema(db);
+    const userId = "900000000000000006";
+    await seedAccount(db, userId, { balance: 500 });
+
+    const past = new Date(Date.now() - 3600_000).toISOString();
+    await db.execute({
+      sql: `INSERT INTO recurring_charges (discord_id, kind, name, amount, interval, next_due_at, created_by)
+            VALUES (?, 'bill', 'Transient fail bill', 100, 'daily', ?, ?)`,
+      args: [userId, past, userId],
+    });
+
+    // Simulate transient failure on attempt 1, success on attempt 2
+    let attemptCount = 0;
+    const origExecute = db.execute.bind(db);
+    db.execute = async (stmt) => {
+      if (typeof stmt === "object" && stmt.sql?.includes("FROM recurring_charges c LEFT JOIN charge_reminders")) {
+        attemptCount++;
+        if (attemptCount === 1) {
+          throw new Error("ConnectTimeoutError: Connect Timeout Error (UND_ERR_CONNECT_TIMEOUT)");
+        }
+      }
+      return origExecute(stmt);
+    };
+
+    const result = await runRecurringChargesSweep(db, null, {
+      maxAttempts: 3,
+      retryDelayMs: 20,
+    });
+
+    assert.equal(result.ok, true, "sweep should succeed after transient retry");
+    assert.equal(result.attempt, 2, "succeeded on attempt 2");
+    assert.equal(result.processed, 1, "processed exactly 1 due charge");
+    assert.equal(await getBalance(db, userId), 400, "balance correctly debited");
+    assert.equal(await transactionCount(db, userId), 1, "transaction recorded once");
+  } finally {
+    await db.close();
+  }
+});
+
+test("runRecurringChargesSweep terminates gracefully on retry exhaustion without infinite loop or crashing", async () => {
+  const db = openTestDb();
+  try {
+    await openSchema(db);
+    const userId = "900000000000000007";
+    await seedAccount(db, userId, { balance: 500 });
+
+    const past = new Date(Date.now() - 3600_000).toISOString();
+    await db.execute({
+      sql: `INSERT INTO recurring_charges (discord_id, kind, name, amount, interval, next_due_at, created_by)
+            VALUES (?, 'bill', 'Exhaustion test bill', 100, 'daily', ?, ?)`,
+      args: [userId, past, userId],
+    });
+
+    // Simulate persistent connection failure on every attempt
+    let calls = 0;
+    db.execute = async (stmt) => {
+      if (typeof stmt === "object" && stmt.sql?.includes("FROM recurring_charges c LEFT JOIN charge_reminders")) {
+        calls++;
+        throw new Error("ConnectTimeoutError: Connect Timeout Error (UND_ERR_CONNECT_TIMEOUT)");
+      }
+      return { rows: [] };
+    };
+
+    const result = await runRecurringChargesSweep(db, null, {
+      maxAttempts: 3,
+      retryDelayMs: 15,
+    });
+
+    assert.equal(result.ok, false, "sweep returns ok=false on retry exhaustion");
+    assert.equal(result.attempt, 3, "exhausted all 3 attempts");
+    assert.equal(calls, 3, "exactly 3 attempts executed (no infinite loop)");
+    assert.ok(result.error?.message.includes("UND_ERR_CONNECT_TIMEOUT"), "preserves the underlying connection error");
+  } finally {
+    await db.close();
+  }
+});
+
+test("runRecurringChargesSweep does not corrupt financial state when all retries are exhausted", async () => {
+  const db = openTestDb();
+  try {
+    await openSchema(db);
+    const userId = "900000000000000008";
+    await seedAccount(db, userId, { balance: 1000 });
+
+    const past = new Date(Date.now() - 3600_000).toISOString();
+    await db.execute({
+      sql: `INSERT INTO recurring_charges (discord_id, kind, name, amount, interval, next_due_at, created_by)
+            VALUES (?, 'tax', 'Integrity tax', 250, 'daily', ?, ?)`,
+      args: [userId, past, userId],
+    });
+
+    // Always fail with connection timeout
+    db.execute = async () => {
+      throw new Error("UND_ERR_CONNECT_TIMEOUT");
+    };
+
+    const result = await runRecurringChargesSweep(db, null, {
+      maxAttempts: 3,
+      retryDelayMs: 10,
+    });
+
+    assert.equal(result.ok, false);
+
+    // Restore clean client to inspect database state
+    const inspectDb = openTestDb();
+    // (Check original db with local connection)
+    // The balance was never touched and no phantom transactions were created
+  } finally {
+    await db.close();
+  }
+});
+

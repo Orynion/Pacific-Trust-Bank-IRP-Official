@@ -14,9 +14,9 @@ import {
   Routes,
   SlashCommandBuilder,
 } from "discord.js";
-import { acknowledgeWithinDeadline, respond } from "./interaction-responder.js";
+import { acknowledgeWithinDeadline, isExpiredInteractionError, respond } from "./interaction-responder.js";
 import { getTransactionHistory, handleHistoryButton } from "./transaction-history.js";
-import { handleBillCommand, processDueCharges, recurringChargeSchemaStatements, sendDueChargeReminders } from "./recurring-charges.js";
+import { handleBillCommand, processDueCharges, recurringChargeSchemaStatements, runRecurringChargesSweep, sendDueChargeReminders } from "./recurring-charges.js";
 import {
   ephemeralReply,
   handleAddBalance,
@@ -71,14 +71,19 @@ const dbUrl = process.env.TURSO_URL || "file:ptb-local.db";
 // Increase the default connect timeout for remote Turso databases.
 // Node's built-in fetch (undici) defaults to a 10 s connect timeout. On
 // high-latency paths to Turso's ap-south-1 endpoint this often expires with
-// UND_ERR_CONNECT_TIMEOUT before the TLS handshake completes. A 15 s ceiling
-// reduces false failures without masking genuine outages.
+// UND_ERR_CONNECT_TIMEOUT before the TLS handshake completes. A 30 s ceiling
+// with TCP/TLS keep-alive connection reuse prevents repeated handshake timeouts.
 let tursoFetchDispatcher;
 if (dbUrl && !dbUrl.startsWith("file:")) {
   try {
     const { Agent } = await import("undici");
-    tursoFetchDispatcher = new Agent({ connect: { timeout: 15_000 } });
-    console.log("[PTB Info] Turso fetch connect timeout set to 15 000 ms.");
+    const timeoutMs = Number(process.env.TURSO_CONNECT_TIMEOUT_MS) || 30_000;
+    tursoFetchDispatcher = new Agent({
+      connect: { timeout: timeoutMs },
+      keepAliveTimeout: 30_000,
+      keepAliveMaxTimeout: 60_000,
+    });
+    console.log(`[PTB Info] Turso fetch connect timeout set to ${timeoutMs} ms with keep-alive.`);
   } catch {
     console.warn("[PTB Info] Could not load undici; using default fetch connect timeout.");
   }
@@ -511,12 +516,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // turns into editReply() and no handler sees "Unknown interaction".
     await acknowledgeWithinDeadline(interaction, () => runChatCommand(interaction), { deferOptions: ephemeralReply });
   } catch (error) {
+    if (isExpiredInteractionError(error)) {
+      console.warn(`[PTB Warning] Command /${interaction.commandName} interaction expired before response could be delivered:`, error?.message ?? error);
+      return;
+    }
     console.error(`Command /${interaction.commandName} failed:`, error);
     await respond(interaction, {
       content: "I could not complete that request right now. Please try again shortly.",
       ...ephemeralReply,
     }).catch((replyError) => {
-      console.error("Could not send command error reply:", replyError);
+      if (!isExpiredInteractionError(replyError)) {
+        console.error("Could not send command error reply:", replyError);
+      }
     });
   }
 });
@@ -581,13 +592,28 @@ async function runChatCommand(interaction) {
   }
 }
 
-try {
-  await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements], "write");
-  // Adds amount_comparison to treasury tables created before the automatic
-  // amount checker; fresh tables already include it and this call is idempotent.
-  await ensureAmountComparisonColumn(db);
-  console.log("PTB ledger database initialized successfully.");
+let startupOk = false;
+for (let attempt = 1; attempt <= 3; attempt += 1) {
+  try {
+    await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements], "write");
+    // Adds amount_comparison to treasury tables created before the automatic
+    // amount checker; fresh tables already include it and this call is idempotent.
+    await ensureAmountComparisonColumn(db);
+    console.log("PTB ledger database initialized successfully.");
+    startupOk = true;
+    break;
+  } catch (error) {
+    if (attempt === 3) {
+      console.error("PTB startup database initialization failed after 3 attempts:", error?.message ?? error);
+      break;
+    }
+    const delayMs = attempt * 2_000;
+    console.warn(`[PTB Warning] Startup database initialization attempt ${attempt} failed; retrying in ${delayMs / 1_000}s:`, error?.message ?? error);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+}
 
+if (startupOk) {
   const hasDiscordConfig = Boolean(
     process.env.DISCORD_TOKEN &&
     process.env.CLIENT_ID &&
@@ -635,21 +661,7 @@ try {
         if (recurringChargesRunning) return;
         recurringChargesRunning = true;
         try {
-          for (let attempt = 1; attempt <= 3; attempt += 1) {
-            try {
-              await sendDueChargeReminders(db, client);
-              await processDueCharges(db, new Date(), client);
-              return;
-            } catch (error) {
-              if (attempt === 3) {
-                console.error("Recurring bill/tax processing failed after 3 attempts:", error);
-                return;
-              }
-              const delayMs = attempt * 2_000;
-              console.warn(`Recurring bill/tax processing attempt ${attempt} failed; retrying in ${delayMs / 1_000}s:`, error?.message ?? error);
-              await new Promise((resolve) => setTimeout(resolve, delayMs));
-            }
-          }
+          await runRecurringChargesSweep(db, client);
         } finally {
           recurringChargesRunning = false;
         }
@@ -664,7 +676,6 @@ try {
   }
 
   ready = true;
-} catch (error) {
-  console.error("PTB startup database initialization failed:", error);
+} else {
   ready = false;
 }

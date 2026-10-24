@@ -58,15 +58,39 @@ export function stripUnsettableFlags(payload) {
 }
 
 /**
+ * Detect whether an error represents an interaction token that expired or was
+ * invalidated by Discord.
+ *
+ * Discord error 10062 is "Unknown interaction" (token expired after 3 s or deleted).
+ * Discord error 40060 is "Interaction has already been acknowledged".
+ */
+export function isExpiredInteractionError(error) {
+  if (!error) return false;
+  if (error.code === 10062 || error.code === 40060 || error.rawError?.code === 10062 || error.rawError?.code === 40060) {
+    return true;
+  }
+  const msg = String(error.message || "");
+  return /unknown interaction|already been acknowledged|interaction.*expired/i.test(msg);
+}
+
+/**
  * Send a response using whichever method matches the interaction's current
  * state: reply when untouched, editReply when deferred, followUp once the
  * first response has been sent. Safe from any code path, including error
  * handlers, without double-responding.
  */
 export async function respond(interaction, payload) {
-  if (!hasAcknowledged(interaction)) return interaction.reply(payload);
-  if (!interaction.replied) return interaction.editReply(stripUnsettableFlags(payload));
-  return interaction.followUp(payload);
+  try {
+    if (!hasAcknowledged(interaction)) return await interaction.reply(payload);
+    if (!interaction.replied) return await interaction.editReply(stripUnsettableFlags(payload));
+    return await interaction.followUp(payload);
+  } catch (error) {
+    if (isExpiredInteractionError(error)) {
+      console.warn("PTB interaction response aborted: interaction expired on Discord:", error?.message ?? error);
+      return null;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -187,7 +211,11 @@ export async function acknowledgeWithinDeadline(interaction, startTask, { timeou
       } catch (error) {
         // A failed deferral must not mask the command's own result; the
         // command's eventual reply will either land or fail on its own.
-        console.warn("PTB could not defer an interaction before the Discord deadline:", error?.message ?? error);
+        if (isExpiredInteractionError(error)) {
+          console.warn("PTB interaction expired before deferral could complete:", error?.message ?? error);
+        } else {
+          console.warn("PTB could not defer an interaction before the Discord deadline:", error?.message ?? error);
+        }
       }
     }
   } finally {

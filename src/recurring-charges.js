@@ -206,3 +206,36 @@ export async function processDueCharges(db, now = new Date(), client = null) {
   }
   return processed;
 }
+
+/**
+ * Run a full recurring-charge sweep (reminders + due deductions) with bounded
+ * retries and backoff to handle transient database connection dropouts.
+ *
+ * Guarantees:
+ * - Bounded retries: stops after maxAttempts (no infinite loop).
+ * - Linear backoff: avoids hammering a recovering Turso instance.
+ * - Non-fatal: returns { ok: false, error } on retry exhaustion without throwing
+ *   so the scheduler process remains stable.
+ */
+export async function runRecurringChargesSweep(db, client, {
+  now = new Date(),
+  maxAttempts = 3,
+  retryDelayMs = 2_000,
+} = {}) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await sendDueChargeReminders(db, client, now);
+      const processed = await processDueCharges(db, now, client);
+      return { ok: true, attempt, processed };
+    } catch (error) {
+      if (attempt >= maxAttempts) {
+        console.error(`Recurring bill/tax processing failed after ${maxAttempts} attempts:`, error?.message ?? error);
+        return { ok: false, attempt, error };
+      }
+      const delay = attempt * retryDelayMs;
+      console.warn(`Recurring bill/tax processing attempt ${attempt} failed; retrying in ${delay / 1000}s:`, error?.message ?? error);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  return { ok: false, attempt: maxAttempts };
+}

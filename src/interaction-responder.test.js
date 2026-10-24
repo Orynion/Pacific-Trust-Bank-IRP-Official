@@ -4,6 +4,7 @@ import { MessageFlags } from "discord.js";
 import {
   acknowledgeWithinDeadline,
   hasAcknowledged,
+  isExpiredInteractionError,
   makeDeferralSafe,
   respond,
   safeDeferReply,
@@ -273,3 +274,163 @@ test("acknowledgeWithinDeadline still defers when the handler has not replied at
   assert.equal(interaction.calls.defer.length, 1);
   assert.equal(interaction.deferred, true);
 });
+
+// ---------------------------------------------------------------------------
+// Regression tests: Slow database checks during slash commands
+// ---------------------------------------------------------------------------
+
+test("slow database checks during slash commands trigger timely deferral so subsequent replies land safely", async () => {
+  const interaction = fakeInteraction();
+
+  // Simulates a command handler performing a database query (e.g. registration
+  // pre-check) that takes 60ms while the acknowledgment deadline is 20ms.
+  let dbCheckCompleted = false;
+  let commandExecuted = false;
+
+  await acknowledgeWithinDeadline(interaction, async () => {
+    // 1. Slow Turso database query
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    dbCheckCompleted = true;
+
+    // 2. Command handler executes and calls interaction.reply()
+    await interaction.reply({
+      content: "Account balance: 1,500",
+      flags: MessageFlags.Ephemeral,
+    });
+    commandExecuted = true;
+  }, { timeoutMs: 20, deferOptions: { flags: MessageFlags.Ephemeral } });
+
+  assert.equal(dbCheckCompleted, true, "database check must have completed");
+  assert.equal(commandExecuted, true, "command handler must have executed");
+  assert.equal(interaction.calls.defer.length, 1, "deadline triggered exactly one deferReply");
+  assert.equal(interaction.calls.reply.length, 0, "direct reply avoided after deferral");
+  assert.equal(interaction.calls.edit.length, 1, "reply was safely routed to editReply");
+  assert.equal(interaction.calls.edit[0].content, "Account balance: 1,500");
+  assert.equal(interaction.calls.edit[0].flags, undefined, "ephemeral flag stripped for edit compatibility");
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests: Already-deferred and already-replied interactions
+// ---------------------------------------------------------------------------
+
+test("already-deferred and already-replied interactions maintain correct semantics across all methods", async () => {
+  // Scenario A: Already deferred interaction
+  const deferredInteraction = fakeInteraction();
+  await deferredInteraction.deferReply({ flags: MessageFlags.Ephemeral });
+  makeDeferralSafe(deferredInteraction);
+
+  // safeDeferReply should return false and not re-defer
+  assert.equal(await safeDeferReply(deferredInteraction, {}), false);
+  assert.equal(deferredInteraction.calls.defer.length, 1);
+
+  // Direct deferReply call should be a safe no-op
+  await deferredInteraction.deferReply({});
+  assert.equal(deferredInteraction.calls.defer.length, 1);
+
+  // respond() should route to editReply
+  await respond(deferredInteraction, { content: "deferred update", flags: MessageFlags.Ephemeral });
+  assert.equal(deferredInteraction.calls.edit.length, 1);
+  assert.equal(deferredInteraction.calls.edit[0].content, "deferred update");
+
+  // Scenario B: Already replied interaction
+  const repliedInteraction = fakeInteraction();
+  makeDeferralSafe(repliedInteraction);
+  await repliedInteraction.reply({ content: "initial reply" });
+
+  // safeDeferReply should return false
+  assert.equal(await safeDeferReply(repliedInteraction, {}), false);
+  assert.equal(repliedInteraction.calls.defer.length, 0);
+
+  // respond() on already-replied interaction should route to followUp
+  await respond(repliedInteraction, { content: "followup message" });
+  assert.equal(repliedInteraction.calls.followUp.length, 1);
+  assert.equal(repliedInteraction.calls.followUp[0].content, "followup message");
+
+  // Direct interaction.reply() on already-replied interaction should also route to followUp
+  await repliedInteraction.reply({ content: "another followup" });
+  assert.equal(repliedInteraction.calls.followUp.length, 2);
+  assert.equal(repliedInteraction.calls.followUp[1].content, "another followup");
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests: Interaction expiration and response failures
+// ---------------------------------------------------------------------------
+
+test("isExpiredInteractionError identifies Discord 10062, 40060, and token expiration errors", () => {
+  // DiscordAPIError with code 10062 (Unknown interaction)
+  assert.equal(isExpiredInteractionError({ code: 10062, message: "Unknown interaction" }), true);
+  // DiscordAPIError with code 40060 (Already acknowledged)
+  assert.equal(isExpiredInteractionError({ code: 40060, message: "Interaction has already been acknowledged." }), true);
+  // rawError nested format from discord.js
+  assert.equal(isExpiredInteractionError({ rawError: { code: 10062 } }), true);
+  assert.equal(isExpiredInteractionError({ rawError: { code: 40060 } }), true);
+  // Error message regex matches
+  assert.equal(isExpiredInteractionError(new Error("DiscordAPIError[10062]: Unknown interaction")), true);
+  assert.equal(isExpiredInteractionError(new Error("The interaction has expired and cannot be responded to")), true);
+  assert.equal(isExpiredInteractionError(new Error("Interaction has already been acknowledged")), true);
+
+  // Unrelated errors should return false
+  assert.equal(isExpiredInteractionError(new Error("Database connection timeout")), false);
+  assert.equal(isExpiredInteractionError({ code: 50035, message: "Invalid Form Body" }), false);
+  assert.equal(isExpiredInteractionError(null), false);
+  assert.equal(isExpiredInteractionError(undefined), false);
+});
+
+test("respond gracefully discards expired interactions without throwing unhandled exceptions", async () => {
+  const expiredInteraction = fakeInteraction();
+  expiredInteraction.reply = async () => {
+    const error = new Error("DiscordAPIError[10062]: Unknown interaction");
+    error.code = 10062;
+    throw error;
+  };
+
+  const result = await respond(expiredInteraction, { content: "late reply" });
+  assert.equal(result, null, "expired interaction returns null instead of throwing");
+});
+
+test("acknowledgeWithinDeadline handles deferral failure when Discord rejects with 10062", async () => {
+  const expiredInteraction = fakeInteraction();
+  // Simulate Discord rejecting the deferReply attempt because interaction expired
+  const origDefer = expiredInteraction.deferReply.bind(expiredInteraction);
+  expiredInteraction.deferReply = async () => {
+    const error = new Error("DiscordAPIError[10062]: Unknown interaction");
+    error.code = 10062;
+    throw error;
+  };
+
+  // The command task should still settle cleanly even if deferral fails due to expiration
+  let taskRan = false;
+  await acknowledgeWithinDeadline(expiredInteraction, async () => {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    taskRan = true;
+  }, { timeoutMs: 20 });
+
+  assert.equal(taskRan, true, "task runs to completion despite failed deferral");
+});
+
+test("chat command error handler does not attempt reply when error is interaction expiration", async () => {
+  // Reproduces the exact error flow from index.js interactionCreate:
+  // If the command failed because Discord threw 10062, the handler must NOT
+  // attempt to call respond() again on the dead token.
+  let respondCalled = false;
+  const mockRespond = async () => { respondCalled = true; };
+
+  const handleInteractionError = async (error) => {
+    if (isExpiredInteractionError(error)) {
+      // Gracefully exit without responding
+      return;
+    }
+    await mockRespond();
+  };
+
+  const expiredError = new Error("DiscordAPIError[10062]: Unknown interaction");
+  expiredError.code = 10062;
+  await handleInteractionError(expiredError);
+  assert.equal(respondCalled, false, "must not attempt to respond to an expired interaction");
+
+  // But for a non-expired error, respond should be called
+  respondCalled = false;
+  await handleInteractionError(new Error("Database connection drop"));
+  assert.equal(respondCalled, true, "must attempt to respond for non-expired errors");
+});
+
