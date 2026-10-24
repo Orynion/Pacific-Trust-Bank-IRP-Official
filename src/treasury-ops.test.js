@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { PermissionFlagsBits } from "discord.js";
 import { __setTreasuryOcrForTests, analyzeReceipt, applyTreasuryReview, ensureAmountComparisonColumn, handleDepositTicketImage, handleTreasuryButton, handleTreasuryReport, inspectReceiptText, submitTreasuryPayment, treasuryReviewer, treasurySchemaStatements, validateReceiptInput } from "./treasury-ops.js";
+import { __setDepositTicketDependencies } from "./ticket-deposit.js";
 import { schemaStatements } from "./bank-ops.js";
 import { ticketSchemaStatements } from "./ticket-ops.js";
 
@@ -126,7 +127,19 @@ test("first image in a pending deposit ticket gets an advisory detection report"
   const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/pZ8AAAAASUVORK5CYII=", "base64");
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(png, { status: 200, headers: { "content-length": String(png.length) } });
-  __setTreasuryOcrForTests(async () => "Payment Successful\nAmount paid: 500\nRecipient: IRP Treasury\nPayer: Alice_1");
+  __setDepositTicketDependencies({
+    analyzeReceipt: async () => ({
+      extractedPayer: "Alice_1",
+      extractedRecipient: "IRP Treasury",
+      extractedAmount: 500,
+      transactionId: null,
+      paymentScreenDetected: true,
+      amountComparison: "MATCH",
+      findings: [],
+      ocrText: "Payment Successful\nAmount paid: 500\nRecipient: IRP Treasury\nPayer: Alice_1",
+    }),
+    buildEmbed: null,
+  });
   let sent;
   try {
     const message = {
@@ -135,13 +148,13 @@ test("first image in a pending deposit ticket gets an advisory detection report"
       attachments: new Map([["att", { contentType: "image/png", size: png.length, url: "https://cdn.example/receipt.png", name: "proof.png" }]]),
     };
     assert.equal(await handleDepositTicketImage(db, message), true);
-    assert.match(sent.embeds[0].data.title, /Experimental receipt detection/);
+    assert.match(sent.embeds[0].data.title, /Deposit receipt analysis/);
     assert.match(sent.embeds[0].data.fields[0].value, /Payment screen: detected from OCR cues/);
     assert.match(sent.embeds[0].data.fields[0].value, /Amount: 500 \(matches ticket amount\)/);
     const saved = await db.execute("SELECT ticket_id,extracted_amount,ocr_text FROM treasury_ticket_receipt_checks");
     assert.equal(Number(saved.rows[0].ticket_id), 7);
     assert.match(saved.rows[0].ocr_text, /Payment Successful/);
-  } finally { __setTreasuryOcrForTests(null); globalThis.fetch = originalFetch; await db.close(); }
+  } finally { __setDepositTicketDependencies({ analyzeReceipt: null, buildEmbed: null }); globalThis.fetch = originalFetch; await db.close(); }
 });
 
 const submissionPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/pZ8AAAAASUVORK5CYII=", "base64");

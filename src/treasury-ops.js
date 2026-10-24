@@ -390,61 +390,11 @@ function isSupportedImage(bytes) {
 }
 
 export async function handleDepositTicketImage(db, message) {
-  if (!message.guild || message.author?.bot || message.attachments.size === 0) return false;
-  const channelTopic = message.channel?.topic ?? "";
-  const topicMatch = channelTopic.match(/^ptb-ticket:deposit:(\d+):(\d+):(\d+)$/);
-  if (!topicMatch) return false;
-  const [, requesterId, , ticketId] = topicMatch;
-  const ticketResult = await db.execute({ sql: "SELECT id,requester_id,amount,status,kind,channel_id FROM tickets WHERE id=? AND channel_id=? LIMIT 1", args: [ticketId, message.channelId] });
-  const ticket = ticketResult.rows[0];
-  if (!ticket || ticket.kind !== "deposit" || ticket.status !== "pending" || ticket.requester_id !== requesterId) return false;
-  const accountResult = await db.execute({ sql: "SELECT roblox_username FROM accounts WHERE discord_id=? LIMIT 1", args: [ticket.requester_id] });
-  const claimedPayer = accountResult.rows[0]?.roblox_username || "";
-  const reportFields = [];
-  for (const attachment of message.attachments.values()) {
-    if (!/^image\/(png|jpeg|webp)$/.test(attachment.contentType ?? "") || attachment.size > maxImageBytes) continue;
-    try {
-      const response = await fetch(attachment.url, { signal: AbortSignal.timeout(10_000) });
-      if (!response.ok || Number(response.headers.get("content-length") || 0) > maxImageBytes) continue;
-      const bytes = Buffer.from(await response.arrayBuffer());
-      if (bytes.length > maxImageBytes || !isSupportedImage(bytes)) continue;
-      const analysis = await analyzeReceipt(bytes, { payer: claimedPayer, amount: Number(ticket.amount) });
-      const exactTreasuryMatch = await db.execute({ sql: "SELECT reference FROM treasury_submissions WHERE screenshot_hash=? LIMIT 1", args: [analysis.hash] });
-      const exactTicketMatch = await db.execute({ sql: "SELECT ticket_id FROM treasury_ticket_receipt_checks WHERE screenshot_hash=? LIMIT 1", args: [analysis.hash] });
-      const exactDuplicate = exactTreasuryMatch.rows[0]?.reference ?? (exactTicketMatch.rows[0] ? `PTB-D-${exactTicketMatch.rows[0].ticket_id}` : null);
-      const findings = [...analysis.findings];
-      if (exactDuplicate) findings.push("EXACT_SCREENSHOT_DUPLICATE");
-      const related = exactDuplicate ?? null;
-      const visualRows = analysis.perceptualHash ? await db.execute({ sql: "SELECT perceptual_hash,reference FROM treasury_submissions WHERE perceptual_hash IS NOT NULL ORDER BY id DESC LIMIT 500" }) : { rows: [] };
-      const visualMatch = visualRows.rows.find((row) => hashDistance(analysis.perceptualHash, row.perceptual_hash) <= 8);
-      if (!exactDuplicate && visualMatch) findings.push("PERCEPTUALLY_SIMILAR_SCREENSHOT_REQUIRES_REVIEW");
-      await db.execute({
-        sql: `INSERT INTO treasury_ticket_receipt_checks (ticket_id,submitted_by,screenshot_hash,perceptual_hash,attachment_url,ocr_text,extracted_payer,extracted_recipient,extracted_amount,findings,duplicate_reference)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-        args: [ticket.id, message.author.id, analysis.hash, analysis.perceptualHash, attachment.url, analysis.ocrText, analysis.extractedPayer, analysis.extractedRecipient, analysis.extractedAmount, JSON.stringify(findings), related ?? visualMatch?.reference ?? null],
-      });
-      const checks = [
-        `Payment screen: ${analysis.paymentScreenDetected ? "detected from OCR cues" : "not confidently identified"}`,
-        `Sender / payer (${claimedPayer || "account has no linked Roblox name"}): ${analysis.extractedPayer ? "matched from explicit sender text" : "not confirmed by OCR"}`,
-        `Recipient (shown after “to”): ${analysis.extractedRecipient ?? "not confirmed by OCR"}`,
-        `Sent amount (including € value): ${analysis.extractedAmount ?? "not readable"}${analysis.amountCheck?.comparison === "MATCH" ? " (matches ticket amount)" : analysis.extractedAmount !== null && analysis.extractedAmount !== Number(ticket.amount) ? ` (ticket claims ${Number(ticket.amount).toLocaleString()})` : ""}`,
-        `Duplicate: ${related ? `exact match to ${related}` : visualMatch ? `visually similar to ${visualMatch.reference ?? "a prior receipt"}` : "no exact or visual match found"}`,
-        `Findings: ${findings.length ? findings.join(", ") : "No OCR discrepancy detected"}`,
-      ];
-      reportFields.push({ name: `Screenshot check for ${attachment.name}`.slice(0, 256), value: checks.join("\n").slice(0, 1024) });
-    } catch (error) {
-      console.warn("PTB experimental deposit receipt analysis failed:", error?.message ?? "unknown error");
-      reportFields.push({ name: `Screenshot check for ${attachment.name}`.slice(0, 256), value: "Image could not be analyzed. A reviewer should inspect the screenshot manually; this does not affect ticket eligibility." });
-    }
-  }
-  if (!reportFields.length) return false;
-  await message.channel.send({
-    embeds: [new EmbedBuilder().setTitle(`Experimental receipt detection · PTB-D-${ticket.id}`).setColor(0xD97706)
-      .setDescription("Automated screenshot checks are advisory and do not prove a genuine in-game payment. A reviewer must inspect the receipt before approving the deposit.")
-      .addFields(reportFields).setFooter({ text: "Experimental OCR and duplicate checks · reviewer decision required" })],
-    allowedMentions: { parse: [] },
-  });
-  return true;
+  // Compatibility export. The ticket-owned integration lives in
+  // ticket-deposit.js so the OCR reader and shared embed utility can be merged
+  // independently.
+  const { handleDepositTicketImage: handler } = await import("./ticket-deposit.js");
+  return handler(db, message);
 }
 
 function reviewComponents(reference) {

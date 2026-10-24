@@ -1,4 +1,16 @@
-import { MessageFlags, PermissionFlagsBits } from "discord.js";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  MessageFlags,
+  ModalBuilder,
+  PermissionFlagsBits,
+  TextInputBuilder,
+  TextInputStyle,
+} from "discord.js";
+import { isTicketStaff, parseIdList, ticketConfig } from "./ticket-config.js";
+import { buildTicketWelcomeEmbed } from "./ptb-embeds.js";
+import { buildTicketTranscript, logTicketEvent } from "./ticket-log.js";
 
 export const ephemeralReply = { flags: MessageFlags.Ephemeral };
 
@@ -38,6 +50,42 @@ export const ticketSchemaStatements = [
 
 export function ticketCode(ticket) {
   return `PTB-${ticket.kind === "deposit" ? "D" : "W"}-${ticket.id}`;
+}
+
+/**
+ * The single ticket panel/welcome payload used by both /deposit and /withdraw.
+ * Formatting comes from the shared PTB embed builder so ticket types cannot drift.
+ */
+export function ticketPanelPayload({ ticket, type, amount, balance, requester, channelId }) {
+  const isDeposit = type === "deposit";
+
+  return {
+    content: `Welcome ${requester}, your private ${type} ticket is ready.`,
+    embeds: [buildTicketWelcomeEmbed({ ticket, type, amount, balance, requester })],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`tkt-approve:${ticket.id}`)
+          .setLabel(isDeposit ? "Approve: receipts verified" : "Approve payout")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`tkt-reject:${ticket.id}`)
+          .setLabel("Reject")
+          .setStyle(ButtonStyle.Danger),
+      ),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`tkt-complete:${ticket.id}`)
+          .setLabel(isDeposit ? "Credit & finalise" : "Mark paid & deduct balance")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`ticket-close:${channelId}:${ticket.id}`)
+          .setLabel("Close ticket")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+    allowedMentions: { users: [requester.id] },
+  };
 }
 
 export async function createPendingTicket(db, { kind, requesterId, amount }) {
@@ -96,7 +144,7 @@ export async function rejectPendingTicketByChannel(db, channelId, note) {
 //   ptb-ticket:<kind>:<requesterId>:<amount>:<ticketId>
 // bank-ops.js builds topics with this pattern and handleTicketClose below
 // validates against it, so the two sides cannot drift.
-export const TICKET_TOPIC_REGEX = /^ptb-ticket:(deposit|withdraw):(\d+):\d+(?::\d+)?$/;
+export const TICKET_TOPIC_REGEX = /^ptb-ticket:(deposit|withdraw):(\d+):(\d+):(\d+)$/;
 
 export function ticketTopic(kind, requesterId, amount, ticketId) {
   return `ptb-ticket:${kind}:${requesterId}:${amount}:${ticketId}`;
@@ -120,6 +168,43 @@ export async function getTicket(db, transaction, ticketId) {
         amount: Number(result.rows[0].amount),
       }
     : null;
+}
+
+export async function getTicketByChannel(db, channelId) {
+  const result = await db.execute({
+    sql: `SELECT id, kind, requester_id, amount, status, channel_id, ledger_id,
+        decision_by, decision_at, completion_by, completion_at, note
+      FROM tickets WHERE channel_id = ? ORDER BY id DESC LIMIT 1`,
+    args: [channelId],
+  });
+  return result.rows.length > 0
+    ? {
+        ...result.rows[0],
+        id: Number(result.rows[0].id),
+        amount: Number(result.rows[0].amount),
+      }
+    : null;
+}
+
+/**
+ * Verify that the interaction happens inside the exact private channel that
+ * owns the ticket. Both the channel id and the topic fields must agree with the
+ * database, so a copied button, a recreated channel, or an edited topic cannot
+ * target another ticket.
+ */
+export async function verifiedTicketFromInteraction(db, interaction, expectedChannelId = interaction.channelId) {
+  const channel = interaction.channel;
+  if (!channel || !expectedChannelId || String(channel.id) !== String(expectedChannelId)) return null;
+  const match = channel.topic?.match(TICKET_TOPIC_REGEX);
+  if (!match) return null;
+  const [, topicKind, topicRequester, topicAmount, topicTicketId] = match;
+  const ticket = await getTicketByChannel(db, channel.id);
+  if (!ticket) return null;
+  if (ticket.id !== Number(topicTicketId)) return null;
+  if (ticket.kind !== topicKind) return null;
+  if (String(ticket.requester_id) !== topicRequester) return null;
+  if (Number(ticket.amount) !== Number(topicAmount)) return null;
+  return ticket;
 }
 
 async function checkCanProcess(db, transaction, ticket, kind) {
@@ -240,6 +325,13 @@ export async function handleTicketDecision(db, interaction, action, ticketIdRaw)
           return;
         }
         await transaction.commit();
+        void logTicketEvent(interaction.client, {
+          action: "TICKET_APPROVED",
+          ticket,
+          actorId: adminId,
+          statusBefore: "pending",
+          statusAfter: "approved",
+        }, { config: ticketConfig() });
         const nextStepHint = ticket.kind === "deposit"
           ? " Next step: use **Credit & finalise** to credit the requester."
           : " Next step: use **Mark paid & deduct balance** once the in-game payout has been delivered.";
@@ -284,6 +376,13 @@ export async function handleTicketDecision(db, interaction, action, ticketIdRaw)
           return;
         }
         await transaction.commit();
+        void logTicketEvent(interaction.client, {
+          action: "TICKET_REJECTED",
+          ticket,
+          actorId: adminId,
+          statusBefore: "pending",
+          statusAfter: "rejected",
+        }, { config: ticketConfig() });
         await interaction.reply({
           content: `${code} rejected by the admin. No balance changes were made.`,
         });
@@ -431,6 +530,14 @@ export async function handleTicketDecision(db, interaction, action, ticketIdRaw)
       });
       const newBalance = Number(updatedBalanceResult.rows[0].balance);
       await transaction.commit();
+      void logTicketEvent(interaction.client, {
+        action: "TICKET_COMPLETED",
+        ticket,
+        actorId: adminId,
+        statusBefore: "approved",
+        statusAfter: "completed",
+        details: `New balance: ${newBalance.toLocaleString()}; ledger #${ledgerId}.`,
+      }, { config: ticketConfig() });
 
       const happened = ticket.kind === "deposit"
         ? `credited ${ticket.amount.toLocaleString()} to <@${ticket.requester_id}>`
@@ -451,44 +558,267 @@ export async function handleTicketDecision(db, interaction, action, ticketIdRaw)
   }
 }
 
+function closureNote(actorId, reason) {
+  const suffix = reason ? `: ${reason}` : "";
+  return `Closed by ticket staff <@${actorId}>${suffix}`;
+}
+
+async function recordTicketClosure(db, ticket, { actorId, reason }) {
+  const note = closureNote(actorId, reason).slice(0, 1000);
+  await db.execute({
+    sql: `UPDATE tickets SET
+        status = CASE WHEN status = 'pending' THEN 'rejected' ELSE status END,
+        decision_by = CASE WHEN status = 'pending' THEN ? ELSE decision_by END,
+        decision_at = CASE WHEN status = 'pending' THEN datetime('now') ELSE decision_at END,
+        note = CASE WHEN note IS NULL OR note = '' THEN ? ELSE note || ' | ' || ? END
+      WHERE id = ? AND channel_id = ?`,
+    args: [actorId, note, note, ticket.id, ticket.channel_id],
+  });
+}
+
+async function performTicketClose(db, interaction, ticket, { reason = "", config = ticketConfig() } = {}) {
+  const statusBefore = ticket.status;
+  await interaction.deferReply(ephemeralReply);
+
+  // Collect the transcript before the channel disappears. Transcript failures
+  // are non-fatal: closing must still work when history is unavailable.
+  let transcript = null;
+  let transcriptUnavailableReason = null;
+  try {
+    const result = await buildTicketTranscript(interaction.channel, ticket);
+    if (result?.buffer) transcript = result;
+    else transcriptUnavailableReason = result?.error ?? "Message history was not available.";
+  } catch (error) {
+    console.warn(`[PTB Ticket] Could not build transcript for ${ticketCode(ticket)}:`, error?.message ?? error);
+    transcriptUnavailableReason = "Transcript creation failed; see the bot console for details.";
+  }
+
+  try {
+    await recordTicketClosure(db, ticket, { actorId: interaction.user.id, reason });
+  } catch (error) {
+    console.error(`Could not record closure of ${ticketCode(ticket)}:`, error);
+  }
+
+  let deleted = false;
+  try {
+    await interaction.channel.delete(`PTB ticket ${ticketCode(ticket)} closed by ${interaction.user.tag ?? interaction.user.id}${reason ? `: ${reason}` : ""}`);
+    deleted = true;
+  } catch (error) {
+    console.error(`Could not delete PTB ticket channel for ${ticketCode(ticket)}:`, error);
+  }
+
+  await logTicketEvent(interaction.client, {
+    action: "TICKET_CLOSED",
+    ticket,
+    actorId: interaction.user.id,
+    reason,
+    statusBefore,
+    statusAfter: statusBefore === "pending" ? "rejected" : statusBefore,
+    transcript,
+    transcriptUnavailableReason,
+  }, { config });
+
+  await interaction.editReply(deleted
+    ? `Ticket ${ticketCode(ticket)} is closed${reason ? " and the closure reason was recorded" : ""}.`
+    : "The ticket was marked closed, but I could not delete the channel. Please ask an administrator to check my Manage Channels permission.")
+    .catch((error) => console.warn("Could not confirm ticket closure to the staff member:", error?.message ?? error));
+}
+
 /**
- * Closes a deposit/withdrawal ticket channel from its Close ticket button.
- * Verifies the interaction targets the real PTB ticket channel (channel ID +
- * channel topic) so the button cannot be abused against unrelated channels,
- * then requires the opener or a server administrator. Pending tickets are
- * marked rejected when their channel closes; approved/completed keep state.
+ * Core close handler (also used by tests/direct calls). It verifies the exact
+ * private ticket channel, then requires an administrator or configured ticket
+ * staff role. The requester and added helpers cannot close the ticket.
  */
-export async function handleTicketClose(db, interaction, channelId, ownerId) {
-  const channel = interaction.channel;
-  if (
-    !channel || channel.id !== channelId ||
-    !channel.topic?.match(TICKET_TOPIC_REGEX) ||
-    channel.topic.split(":")[2] !== ownerId
-  ) {
+export async function handleTicketClose(db, interaction, channelId, _legacyOwnerOrTicketId, options = {}) {
+  const config = options.config ?? ticketConfig();
+  let ticket;
+  try {
+    ticket = await verifiedTicketFromInteraction(db, interaction, channelId);
+  } catch (error) {
+    console.error("Could not verify PTB ticket before closing:", error);
+    await interaction.reply({ content: "I could not verify this ticket right now. Please try again.", ...ephemeralReply });
+    return;
+  }
+  if (!ticket) {
     await interaction.reply({ content: "This ticket could not be verified.", ...ephemeralReply });
     return;
   }
 
-  if (
-    interaction.user.id !== ownerId &&
-    !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
-  ) {
-    await interaction.reply({ content: "Only the ticket opener or a server administrator can close this ticket.", ...ephemeralReply });
+  if (!isTicketStaff(interaction, config.staffRoleIds)) {
+    await logTicketEvent(interaction.client, {
+      action: "TICKET_ACTION_DENIED",
+      ticket,
+      actorId: interaction.user.id,
+      details: "Attempted to close a ticket without a ticket staff role.",
+    }, { config });
+    await interaction.reply({
+      content: "Only ticket staff can close this ticket. Ask a staff member to close it for you.",
+      ...ephemeralReply,
+    });
+    return;
+  }
+
+  const reason = String(options.reason ?? "").trim().slice(0, 500);
+  await performTicketClose(db, interaction, ticket, { reason, config });
+}
+
+/**
+ * Close-button entry point. Staff get an optional-reason modal; the actual
+ * close happens on submit through handleTicketCloseModal. If a client cannot
+ * show modals, the verified staff close still works directly.
+ */
+export async function handleTicketCloseRequest(db, interaction, channelId, _ticketRef = null, options = {}) {
+  const config = options.config ?? ticketConfig();
+  let ticket;
+  try {
+    ticket = await verifiedTicketFromInteraction(db, interaction, channelId);
+  } catch (error) {
+    console.error("Could not verify PTB ticket before opening the close dialog:", error);
+    await interaction.reply({ content: "I could not verify this ticket right now. Please try again.", ...ephemeralReply });
+    return;
+  }
+  if (!ticket) {
+    await interaction.reply({ content: "This ticket could not be verified.", ...ephemeralReply });
+    return;
+  }
+  if (!isTicketStaff(interaction, config.staffRoleIds)) {
+    await logTicketEvent(interaction.client, {
+      action: "TICKET_ACTION_DENIED",
+      ticket,
+      actorId: interaction.user.id,
+      details: "Attempted to close a ticket without a ticket staff role.",
+    }, { config });
+    await interaction.reply({
+      content: "Only ticket staff can close this ticket. Ask a staff member to close it for you.",
+      ...ephemeralReply,
+    });
+    return;
+  }
+  if (typeof interaction.showModal !== "function") {
+    return handleTicketClose(db, interaction, channelId, null, { config });
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`tcm-close:${ticket.id}`)
+    .setTitle(`Close ${ticketCode(ticket)}`.slice(0, 45));
+  modal.addComponents(new ActionRowBuilder().addComponents(
+    new TextInputBuilder()
+      .setCustomId("reason")
+      .setLabel("Closure reason (optional)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(false)
+      .setMaxLength(500)
+      .setPlaceholder("Example: request handled, receipt verified and credited"),
+  ));
+  try {
+    await interaction.showModal(modal);
+  } catch (error) {
+    console.error(`Could not show the close dialog for ${ticketCode(ticket)}:`, error);
+    await interaction.reply({ content: "I could not open the closure dialog. Please try again or ask an administrator.", ...ephemeralReply }).catch(() => {});
+  }
+}
+
+/** Modal submit handler for the optional closure reason. */
+export async function handleTicketCloseModal(db, interaction) {
+  const match = interaction.customId?.match(/^tcm-close:(\d+)$/);
+  if (!match) return false;
+  const config = ticketConfig();
+  const ticket = await getTicket(db, db, Number(match[1]));
+  if (!ticket || !ticket.channel_id || String(interaction.channelId) !== String(ticket.channel_id)) {
+    await interaction.reply({ content: "This ticket could not be verified.", ...ephemeralReply });
+    return true;
+  }
+  const verified = await verifiedTicketFromInteraction(db, interaction, ticket.channel_id);
+  if (!verified) {
+    await interaction.reply({ content: "This ticket could not be verified.", ...ephemeralReply });
+    return true;
+  }
+  if (!isTicketStaff(interaction, config.staffRoleIds)) {
+    await logTicketEvent(interaction.client, {
+      action: "TICKET_ACTION_DENIED",
+      ticket: verified,
+      actorId: interaction.user.id,
+      details: "Attempted to submit a ticket closure without a ticket staff role.",
+    }, { config });
+    await interaction.reply({ content: "Only ticket staff can close this ticket.", ...ephemeralReply });
+    return true;
+  }
+  let reason = "";
+  try {
+    reason = String(interaction.fields?.getTextInputValue("reason") ?? "").trim().slice(0, 500);
+  } catch {
+    reason = "";
+  }
+  await performTicketClose(db, interaction, verified, { reason, config });
+  return true;
+}
+
+function staffRolesFrom(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") return parseIdList(value);
+  return ticketConfig().staffRoleIds;
+}
+
+/**
+ * Secure /add-user: only ticket staff, only inside the exact ticket channel,
+ * never bots, and only explicit per-user view/send/history permissions.
+ */
+export async function handleAddUser(db, interaction, roleIds = ticketConfig().staffRoleIds) {
+  const config = { ...ticketConfig(), staffRoleIds: staffRolesFrom(roleIds) };
+  if (!interaction.inGuild?.() || !interaction.guild || !interaction.channel) {
+    await interaction.reply({ content: "Use /add-user inside the private ticket channel you want to share.", ...ephemeralReply });
+    return;
+  }
+  if (!isTicketStaff(interaction, config.staffRoleIds)) {
+    await interaction.reply({ content: "Only ticket staff can add a user to a ticket.", ...ephemeralReply });
+    return;
+  }
+
+  let ticket;
+  try {
+    ticket = await verifiedTicketFromInteraction(db, interaction, interaction.channelId);
+  } catch (error) {
+    console.error("Could not verify PTB ticket before /add-user:", error);
+    await interaction.reply({ content: "I could not verify this ticket right now. Please try again.", ...ephemeralReply });
+    return;
+  }
+  if (!ticket) {
+    await interaction.reply({ content: "This command only works inside a verified PTB ticket channel.", ...ephemeralReply });
+    return;
+  }
+
+  const user = interaction.options.getUser("user", true);
+  if (!user || user.bot) {
+    await interaction.reply({ content: "Bots cannot be added to a private ticket.", ...ephemeralReply });
+    return;
+  }
+  if (String(user.id) === String(ticket.requester_id)) {
+    await interaction.reply({ content: "The ticket requester already has access to this channel.", ...ephemeralReply });
+    return;
+  }
+  if (!interaction.channel.permissionOverwrites || typeof interaction.channel.permissionOverwrites.edit !== "function") {
+    await interaction.reply({ content: "I cannot update this channel's permissions right now. Please ask an administrator to check my Manage Channels permission.", ...ephemeralReply });
     return;
   }
 
   await interaction.deferReply(ephemeralReply);
   try {
-    // A pending ticket whose channel is closed can no longer be reviewed, so
-    // record it as rejected (approved/completed tickets keep their state).
-    // A database hiccup here must not block the Discord cleanup.
-    await rejectPendingTicketByChannel(db, channelId, "Ticket channel closed").catch((error) => {
-      console.error("Could not reject pending PTB ticket on close:", error);
-    });
-    await channel.delete(`PTB ticket closed by ${interaction.user.tag}`);
-    await interaction.editReply("Ticket closed.");
+    await interaction.channel.permissionOverwrites.edit(user.id, {
+      ViewChannel: true,
+      SendMessages: true,
+      ReadMessageHistory: true,
+      AttachFiles: true,
+      EmbedLinks: true,
+    }, { reason: `${ticketCode(ticket)} helper added by ${interaction.user.id}` });
+    await interaction.editReply(`${user} can now view and reply in ${ticketCode(ticket)}.`);
+    await logTicketEvent(interaction.client, {
+      action: "TICKET_USER_ADDED",
+      ticket,
+      actorId: interaction.user.id,
+      details: `Added <@${user.id}> as a ticket helper.`,
+    }, { config });
   } catch (error) {
-    console.error("Could not close PTB ticket:", error);
-    await interaction.editReply("I could not close this ticket. Please ask a server administrator to check my Manage Channels permission.");
+    console.error(`Could not add a helper to ${ticketCode(ticket)}:`, error);
+    await interaction.editReply("I could not add that user to the ticket. Please ask an administrator to check my Manage Channels permission.");
   }
 }

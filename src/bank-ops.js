@@ -1,11 +1,15 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, EmbedBuilder, MessageFlags, PermissionFlagsBits } from "discord.js";
+import { ChannelType, EmbedBuilder, MessageFlags, PermissionFlagsBits } from "discord.js";
 import {
   attachTicketChannel,
   createPendingTicket,
   rejectTicketWithNote,
+  ticketCode as formatTicketCode,
+  ticketPanelPayload,
   ticketTopic,
   ticketTopicPrefix,
 } from "./ticket-ops.js";
+import { resolveStaffRoles, resolveTicketCategory, ticketConfig } from "./ticket-config.js";
+import { logTicketEvent } from "./ticket-log.js";
 
 export const MAX_BALANCE = 2_147_483_647;
 
@@ -130,20 +134,41 @@ export async function handleMoneyRequest(db, interaction, type) {
     await interaction.editReply("I could not open the ticket right now because the ledger database rejected it. Please try again shortly.");
     return;
   }
-  const ticketCode = `PTB-${type === "deposit" ? "D" : "W"}-${ticketId}`;
+  const ticketCode = formatTicketCode({ kind: type, id: ticketId });
+  const config = ticketConfig();
+  const [category, staffRoles] = await Promise.all([
+    resolveTicketCategory(interaction.guild, config.categoryId),
+    resolveStaffRoles(interaction.guild, config.staffRoleIds),
+  ]);
+  if (!staffRoles.length) {
+    console.warn("[PTB Ticket] No usable TICKET_STAFF_ROLE_IDS configured; only administrators will have staff access to new tickets.");
+  }
+  const staffOverwrites = staffRoles.map((role) => ({
+    id: role.id,
+    allow: [
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ReadMessageHistory,
+      PermissionFlagsBits.AttachFiles,
+      PermissionFlagsBits.EmbedLinks,
+      PermissionFlagsBits.ManageMessages,
+    ],
+  }));
 
   const safeUsername = interaction.user.username
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
-    .slice(0, 70) || interaction.user.id;
+    .slice(0, 60) || interaction.user.id;
+  const channelName = `${type}-${ticketId}-${safeUsername}`.slice(0, 100);
   let channel;
   try {
     channel = await interaction.guild.channels.create({
-      name: `${type}-${safeUsername}`,
+      name: channelName,
       type: ChannelType.GuildText,
       topic: ticketTopic(type, interaction.user.id, amount, ticketId),
+      ...(category ? { parent: category.id } : {}),
       permissionOverwrites: [
         {
           id: interaction.guild.roles.everyone.id,
@@ -165,13 +190,23 @@ export async function handleMoneyRequest(db, interaction, type) {
             PermissionFlagsBits.ViewChannel,
             PermissionFlagsBits.SendMessages,
             PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.EmbedLinks,
             PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ManageMessages,
           ],
         },
+        ...staffOverwrites,
       ],
     });
   } catch (error) {
     await rejectTicketWithNote(db, ticketId, "Ticket channel could not be created").catch(() => {});
+    void logTicketEvent(interaction.client, {
+      action: "TICKET_ACTION_DENIED",
+      ticket: { id: ticketId, kind: type, requester_id: interaction.user.id, amount },
+      actorId: interaction.user.id,
+      details: `Ticket channel creation failed: ${error?.message ?? "unknown error"}`,
+    }, { config });
     throw error;
   }
   try {
@@ -188,36 +223,20 @@ export async function handleMoneyRequest(db, interaction, type) {
   }
 
   try {
-    const requestDetails = type === "deposit"
-      ? `🧪 **EXPERIMENTAL RECEIPT DETECTION**\nUpload your in-game transaction screenshot here as your first message. PTB will run advisory OCR and duplicate checks, then show the findings below. Detection can miss or misread details and does not prove a transfer; a reviewer must inspect the screenshot before approving.\n\nPlease add any context needed to review your deposit for **${amount.toLocaleString()}**.`
-      : `Please provide any details needed to review your withdrawal request for **${amount.toLocaleString()}**. Your balance was **${balance.toLocaleString()}** when you opened this ticket. This request does not reserve funds, so your available balance may change before it is processed.`;
-    const decisionDetails = type === "deposit"
-      ? `Administrator workflow: press **Approve** once receipt of the in-game funds is verified, then **Credit & finalise** to move the ledger funds. Nothing is credited until the deposit is completed.`
-      : `Administrator workflow: review the request, press **Approve payout**, deliver the in-game payout, then press **Mark paid & deduct balance** — the PTB balance is only deducted when that last step is completed.`;
-    const approveButton = new ButtonBuilder()
-      .setCustomId(`tkt-approve:${ticketId}`)
-      .setLabel(type === "deposit" ? "Approve: receipts verified" : "Approve payout")
-      .setStyle(ButtonStyle.Success);
-    const rejectButton = new ButtonBuilder()
-      .setCustomId(`tkt-reject:${ticketId}`)
-      .setLabel("Reject")
-      .setStyle(ButtonStyle.Danger);
-    const completeButton = new ButtonBuilder()
-      .setCustomId(`tkt-complete:${ticketId}`)
-      .setLabel(type === "deposit" ? "Credit & finalise" : "Mark paid & deduct balance")
-      .setStyle(ButtonStyle.Primary);
-    const closeButton = new ButtonBuilder()
-      .setCustomId(`ticket-close:${channel.id}:${interaction.user.id}`)
-      .setLabel("Close ticket")
-      .setStyle(ButtonStyle.Secondary);
-    await channel.send({
-      content: `${type === "deposit" ? "🧪 **EXPERIMENTAL FEATURE**\n\n" : ""}${interaction.user} opened a **${type} request** for **${amount.toLocaleString()}**.\n\n${requestDetails}\n\nThis is a private ticket visible to you, the bot, and server administrators. The request is stored as ticket **${ticketCode}** (status: pending); opening it does not change your PTB balance.\n\n${decisionDetails}\nClosing the ticket while it is still pending records it as rejected.`,
-      components: [
-        new ActionRowBuilder().addComponents(approveButton, rejectButton),
-        new ActionRowBuilder().addComponents(completeButton, closeButton),
-      ],
-      allowedMentions: { users: [interaction.user.id] },
-    });
+    await channel.send(ticketPanelPayload({
+      ticket: { id: ticketId, kind: type },
+      type,
+      amount,
+      balance,
+      requester: interaction.user,
+      channelId: channel.id,
+    }));
+    void logTicketEvent(interaction.client, {
+      action: "TICKET_OPENED",
+      ticket: { id: ticketId, kind: type, requester_id: interaction.user.id, amount, channel_id: channel.id },
+      actorId: interaction.user.id,
+      details: `Channel <#${channel.id}>${category ? ` in category <#${category.id}>` : ""}.`,
+    }, { config });
   } catch (error) {
     await rejectTicketWithNote(db, ticketId, "Ticket message could not be posted").catch(() => {});
     await channel.delete("Could not initialize the PTB money request ticket").catch(() => {});

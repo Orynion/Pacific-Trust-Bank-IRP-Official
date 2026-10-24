@@ -25,8 +25,10 @@ import {
   schemaStatements,
 } from "./bank-ops.js";
 import { BLOXLINK_VERIFY_URL, createRegistrationEventHandler, validateRegistrationConfig, validateRoleAssignmentAccess } from "./bloxlink-registration.js";
-import { handleTicketClose, handleTicketDecision, ticketSchemaStatements } from "./ticket-ops.js";
-import { ensureAmountComparisonColumn, handleDepositTicketImage, handleTreasuryButton, handleTreasuryHistory, handleTreasuryModal, handleTreasuryReport, handleTreasurySearch, handleTreasuryStatus, handleTreasuryTotal, submitTreasuryPayment, treasurySchemaStatements } from "./treasury-ops.js";
+import { handleAddUser, handleTicketCloseModal, handleTicketCloseRequest, handleTicketDecision, ticketSchemaStatements } from "./ticket-ops.js";
+import { ticketConfig, validateTicketConfiguration } from "./ticket-config.js";
+import { handleDepositTicketImage, ticketDepositSchemaStatements } from "./ticket-deposit.js";
+import { ensureAmountComparisonColumn, handleTreasuryButton, handleTreasuryHistory, handleTreasuryModal, handleTreasuryReport, handleTreasurySearch, handleTreasuryStatus, handleTreasuryTotal, submitTreasuryPayment, treasurySchemaStatements } from "./treasury-ops.js";
 
 const requiredEnv = ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID", "TURSO_URL", "TURSO_AUTH_TOKEN"];
 const missingEnv = requiredEnv.filter((name) => !process.env[name]);
@@ -110,6 +112,14 @@ function createMoneyRequestCommand(name, description) {
 
 const depositCommand = createMoneyRequestCommand("deposit", "Open a private ticket to request a deposit.");
 const withdrawCommand = createMoneyRequestCommand("withdraw", "Open a private ticket to request a withdrawal.");
+
+const addUserCommand = new SlashCommandBuilder()
+  .setName("add-user")
+  .setDescription("Add a user to the current private ticket (ticket staff only).")
+  .addUserOption((option) => option
+    .setName("user")
+    .setDescription("The user who should be able to view and reply in this ticket.")
+    .setRequired(true));
 
 const addBalanceCommand = new SlashCommandBuilder()
   .setName("add-balance")
@@ -196,6 +206,7 @@ function createHelpEmbed(isAdministrator) {
           "`/transaction history` — View your recent ledger activity with timestamps.\nExample: `/transaction history`",
           "`/deposit amount` — Open a private ticket to request a deposit.\nExample: `/deposit amount:500`",
           "`/withdraw amount` — Open a private ticket to request a withdrawal.\nExample: `/withdraw amount:250`",
+          "`/add-user user` — Ticket staff can let another member view and reply in the current private ticket.",
           "`/transfer user amount confirm` — Transfer ledger funds to another user.\nExample: `/transfer user:@Alex amount:100 confirm:True`",
         ].join("\n\n"),
       },
@@ -346,10 +357,10 @@ const handleGuildMemberUpdate = createRegistrationEventHandler({
 });
 client.on(Events.GuildMemberUpdate, (oldMember, newMember) => void handleGuildMemberUpdate(oldMember, newMember));
 client.on(Events.MessageCreate, (message) => {
-  void handleDepositTicketImage(db, message).catch((error) => console.error("PTB experimental deposit receipt detection failed:", error));
+  void handleDepositTicketImage(db, message).catch((error) => console.error("PTB deposit receipt analysis failed:", error));
 });
 
-const INVITE_PERMISSIONS = 268_520_464; // Manage Channels, Manage Roles, View Channels, Send Messages, Embed Links, Read Message History
+const INVITE_PERMISSIONS = 268_561_424; // Manage Channels, Manage Roles, View Channels, Send Messages, Manage Messages, Embed Links, Attach Files, Read Message History
 
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
@@ -357,6 +368,16 @@ client.once(Events.ClientReady, async (readyClient) => {
   // ever work in a server this bot account actually joined.
   const memberServers = readyClient.guilds.cache.map((guild) => `${guild.name} (${guild.id})`);
   console.log(`[PTB Config] Bot is a member of ${memberServers.length} server${memberServers.length === 1 ? "" : "s"}: ${memberServers.join(", ") || "none"}`);
+  try {
+    const ticketGuild = readyClient.guilds.cache.get(process.env.GUILD_ID) ?? readyClient.guilds.cache.first();
+    if (ticketGuild) {
+      const report = await validateTicketConfiguration(ticketGuild);
+      if (report.problems.length) console.warn(`[PTB Ticket] Configuration warnings: ${report.problems.join("; ")}`);
+      else console.log("[PTB Ticket] Category, staff roles, and log channel configuration verified.");
+    }
+  } catch (error) {
+    console.warn("[PTB Ticket] Could not verify ticket configuration at startup:", error?.message ?? error);
+  }
   if (!registrationConfig.ok) return;
   if (!readyClient.guilds.cache.has(process.env.GUILD_ID)) {
     console.error(`[PTB Config] GUILD_ID (${process.env.GUILD_ID}) is not a server this bot belongs to, so registration stays disabled.` +
@@ -386,6 +407,16 @@ client.once(Events.ClientReady, async (readyClient) => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isModalSubmit() && interaction.customId.startsWith("tcm-close:")) {
+    try { await handleTicketCloseModal(db, interaction); }
+    catch (error) {
+      console.error("PTB ticket close modal failed:", error);
+      const reply = { content: "I could not close this ticket right now. It keeps its current state, so you can safely retry.", ...ephemeralReply };
+      if (interaction.replied || interaction.deferred) await interaction.followUp(reply).catch(() => {});
+      else await interaction.reply(reply).catch(() => {});
+    }
+    return;
+  }
   if (interaction.isModalSubmit() && interaction.customId.startsWith("trm-")) {
     try { await handleTreasuryModal(db, interaction, TREASURY_REVIEW_ROLES); }
     catch (error) { console.error("PTB treasury modal failed:", error); await interaction.reply({ content: "I could not process that treasury review action.", ...ephemeralReply }).catch(() => {}); }
@@ -421,11 +452,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    const ticketCloseMatch = interaction.customId.match(/^ticket-close:(\d+):(\d+)$/);
+    const ticketCloseMatch = interaction.customId.match(/^ticket-close:(\d+)(?::(\d+))?$/);
     if (ticketCloseMatch) {
-      await handleTicketClose(db, interaction, ticketCloseMatch[1], ticketCloseMatch[2]).catch(async (error) => {
+      await handleTicketCloseRequest(db, interaction, ticketCloseMatch[1], ticketCloseMatch[2] ?? null).catch(async (error) => {
         console.error("PTB ticket close button failed:", error);
-        const reply = { content: "I could not close this ticket right now.", ...ephemeralReply };
+        const reply = { content: "I could not close this ticket right now. It keeps its current state, so you can safely retry.", ...ephemeralReply };
         if (interaction.replied || interaction.deferred) {
           await interaction.followUp(reply).catch(() => {});
         } else {
@@ -455,6 +486,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   try {
     if (interaction.commandName !== "register" && interaction.commandName !== "unregister" &&
+        interaction.commandName !== "add-user" &&
         !["treasury-search", "treasury-report", "treasury-total"].includes(interaction.commandName)) {
       const accountResult = await db.execute({
         sql: "SELECT 1 FROM accounts WHERE discord_id = ? AND roblox_id IS NOT NULL LIMIT 1",
@@ -485,6 +517,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleMoneyRequest(db, interaction, "deposit");
     } else if (interaction.commandName === "withdraw") {
       await handleMoneyRequest(db, interaction, "withdraw");
+    } else if (interaction.commandName === "add-user") {
+      await handleAddUser(db, interaction, ticketConfig().staffRoleIds);
     } else if (interaction.commandName === "add-balance") {
       await handleAddBalance(db, interaction);
     } else if (interaction.commandName === "transfer") {
@@ -527,7 +561,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 try {
-  await db.batch([...schemaStatements, ...ticketSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements], "write");
+  await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements], "write");
   // Adds amount_comparison to treasury tables created before the automatic
   // amount checker; fresh tables already include it and this call is idempotent.
   await ensureAmountComparisonColumn(db);
@@ -554,6 +588,7 @@ try {
             transactionCommand.toJSON(),
             depositCommand.toJSON(),
             withdrawCommand.toJSON(),
+            addUserCommand.toJSON(),
             addBalanceCommand.toJSON(),
             transferCommand.toJSON(),
             billCommand.toJSON(),
