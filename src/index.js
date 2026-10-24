@@ -606,12 +606,31 @@ try {
 
       await client.login(process.env.DISCORD_TOKEN);
 
+      let recurringChargesRunning = false;
       const runRecurringCharges = async () => {
+        // A short network interruption should not leave the scheduled sweep
+        // waiting for the next minute. Keep retries bounded so the interval
+        // cannot pile up overlapping runs during a longer outage.
+        if (recurringChargesRunning) return;
+        recurringChargesRunning = true;
         try {
-          await sendDueChargeReminders(db, client);
-          await processDueCharges(db, new Date(), client);
-        } catch (error) {
-          console.error("Recurring bill/tax processing failed:", error);
+          for (let attempt = 1; attempt <= 3; attempt += 1) {
+            try {
+              await sendDueChargeReminders(db, client);
+              await processDueCharges(db, new Date(), client);
+              return;
+            } catch (error) {
+              if (attempt === 3) {
+                console.error("Recurring bill/tax processing failed after 3 attempts:", error);
+                return;
+              }
+              const delayMs = attempt * 2_000;
+              console.warn(`Recurring bill/tax processing attempt ${attempt} failed; retrying in ${delayMs / 1_000}s:`, error?.message ?? error);
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+          }
+        } finally {
+          recurringChargesRunning = false;
         }
       };
       void runRecurringCharges();
