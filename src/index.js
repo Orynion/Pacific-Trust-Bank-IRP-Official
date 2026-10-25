@@ -39,14 +39,14 @@ if (missingEnv.length) {
 }
 const port = Number(process.env.PORT || 3000);
 
-let ready = false;
+let discordReady = false;
 
 const healthServer = createServer((request, response) => {
   try {
     const requestUrl = new URL(request.url ?? "/", "http://localhost");
     if (requestUrl.pathname === "/health" || requestUrl.pathname === "/") {
-      response.writeHead(ready ? 200 : 503, { "content-type": "text/plain; charset=utf-8" });
-      response.end(ready ? "ok" : "starting");
+      response.writeHead(discordReady ? 200 : 503, { "content-type": "text/plain; charset=utf-8" });
+      response.end(discordReady ? "ok" : "starting");
       return;
     }
 
@@ -389,6 +389,7 @@ client.on(Events.MessageCreate, (message) => {
 const INVITE_PERMISSIONS = 268_561_424; // Manage Channels, Manage Roles, View Channels, Send Messages, Manage Messages, Embed Links, Attach Files, Read Message History
 
 client.once(Events.ClientReady, async (readyClient) => {
+  discordReady = true;
   console.log(`Logged in as ${readyClient.user.tag}`);
   // Membership truth comes from the live gateway cache: registration can only
   // ever work in a server this bot account actually joined.
@@ -533,7 +534,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 async function runChatCommand(interaction) {
-  if (interaction.commandName !== "register" && interaction.commandName !== "unregister" &&
+  if (!["ping", "help", "register", "unregister"].includes(interaction.commandName) &&
       interaction.commandName !== "add-user" &&
       !["treasury-search", "treasury-report", "treasury-total"].includes(interaction.commandName)) {
     const accountResult = await db.execute({
@@ -592,37 +593,52 @@ async function runChatCommand(interaction) {
   }
 }
 
-let startupOk = false;
-for (let attempt = 1; attempt <= 3; attempt += 1) {
+const hasDiscordConfig = Boolean(
+    process.env.DISCORD_TOKEN &&
+    process.env.CLIENT_ID &&
+    process.env.GUILD_ID,
+);
+
+async function initializeDatabase() {
   try {
     await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements], "write");
     // Adds amount_comparison to treasury tables created before the automatic
     // amount checker; fresh tables already include it and this call is idempotent.
     await ensureAmountComparisonColumn(db);
     console.log("PTB ledger database initialized successfully.");
-    startupOk = true;
-    break;
+    return true;
   } catch (error) {
-    if (attempt === 3) {
-      console.error("PTB startup database initialization failed after 3 attempts:", error?.message ?? error);
-      break;
-    }
-    const delayMs = attempt * 2_000;
-    console.warn(`[PTB Warning] Startup database initialization attempt ${attempt} failed; retrying in ${delayMs / 1_000}s:`, error?.message ?? error);
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    console.error("PTB database initialization failed; Discord startup will continue and database-backed commands may be unavailable:", {
+      name: error?.name ?? "Error",
+      code: error?.code ?? "unknown",
+      message: String(error?.message ?? "unknown error").replace(/(libsql:\/\/|https?:\/\/)[^\s)]+/gi, "[database endpoint]"),
+    });
+    return false;
   }
 }
 
-if (startupOk) {
-  const hasDiscordConfig = Boolean(
-    process.env.DISCORD_TOKEN &&
-    process.env.CLIENT_ID &&
-    process.env.GUILD_ID,
-  );
+let databaseRetryRunning = false;
+async function retryDatabaseInitialization() {
+  if (databaseRetryRunning) return;
+  databaseRetryRunning = true;
+  try {
+    const initialized = await initializeDatabase();
+    if (initialized) clearInterval(databaseRetryTimer);
+  } finally {
+    databaseRetryRunning = false;
+  }
+}
+let databaseRetryTimer;
 
-  if (hasDiscordConfig) {
-    try {
-      const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+async function startDiscord() {
+  if (!hasDiscordConfig) {
+    console.error("[PTB Startup] Discord gateway not started: missing required environment variables:",
+      ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID"].filter((name) => !process.env[name]).join(", "));
+    return;
+  }
+
+  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+  try {
       await rest.put(
         Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
         {
@@ -650,8 +666,15 @@ if (startupOk) {
         },
       );
       console.log("Discord slash commands registered successfully.");
+  } catch (error) {
+    console.error("PTB slash-command registration failed; attempting gateway login so existing commands can still work:", {
+      name: error?.name ?? "Error", code: error?.code ?? "unknown", message: error?.message ?? "unknown error",
+    });
+  }
 
+  try {
       await client.login(process.env.DISCORD_TOKEN);
+      console.log("Discord gateway login accepted; waiting for ClientReady.");
 
       let recurringChargesRunning = false;
       const runRecurringCharges = async () => {
@@ -668,14 +691,16 @@ if (startupOk) {
       };
       void runRecurringCharges();
       setInterval(runRecurringCharges, 60_000).unref();
-    } catch (discordError) {
-      console.error("Discord bot login/command registration failed:", discordError.message || discordError);
-    }
-  } else {
-    console.log("[PTB Standby] Discord credentials (DISCORD_TOKEN, CLIENT_ID, GUILD_ID) not fully configured in .env. Bot gateway on standby.");
+  } catch (error) {
+    console.error("PTB Discord gateway login failed:", {
+      name: error?.name ?? "Error", code: error?.code ?? "unknown", message: error?.message ?? "unknown error",
+    });
   }
-
-  ready = true;
-} else {
-  ready = false;
 }
+
+if (!await initializeDatabase()) {
+  console.warn("[PTB Startup] Retrying database initialization every 30 seconds until it succeeds.");
+  databaseRetryTimer = setInterval(() => void retryDatabaseInitialization(), 30_000);
+  databaseRetryTimer.unref();
+}
+await startDiscord();
