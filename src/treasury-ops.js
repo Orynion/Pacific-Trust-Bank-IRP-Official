@@ -323,8 +323,49 @@ export async function submitTreasuryPayment(db, interaction, { reviewChannelId, 
   const problem = validateReceiptInput({ payer, amount, purpose, attachment });
   if (problem) return interaction.reply({ content: problem, ...treasuryEphemeral });
   if (!interaction.inGuild()) return interaction.reply({ content: "Treasury submissions can only be made in the PTB server.", ...treasuryEphemeral });
-  if (!reviewChannelId) return interaction.reply({ content: "Treasury submissions are not configured. Contact a PTB administrator.", ...treasuryEphemeral });
   await interaction.deferReply(treasuryEphemeral);
+
+  let targetChannelId = reviewChannelId || process.env.TREASURY_REVIEW_CHANNEL_ID || process.env.TICKET_LOG_CHANNEL_ID;
+  if (!targetChannelId && interaction.guild) {
+    try {
+      const channels = interaction.guild.channels?.cache || (await interaction.guild.channels?.fetch?.().catch(() => null));
+      const candidates = ["treasury-review", "treasury-submissions", "treasury-receipts", "treasury-log", "treasury-logs", "treasury", "ptb-logs", "ticket-logs"];
+      const match = channels?.find?.((c) =>
+        c && [ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(c.type) &&
+        candidates.includes(c.name?.toLowerCase())
+      );
+      if (match) targetChannelId = match.id;
+    } catch {}
+  }
+  if (!targetChannelId && interaction.guild?.channels?.create) {
+    try {
+      const created = await interaction.guild.channels.create({
+        name: "treasury-review",
+        type: ChannelType.GuildText,
+        topic: "IRP Treasury payment submissions for review",
+        permissionOverwrites: [
+          {
+            id: interaction.guild.roles.everyone.id,
+            deny: [PermissionFlagsBits.ViewChannel],
+          },
+          {
+            id: interaction.client.user.id,
+            allow: [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.EmbedLinks,
+              PermissionFlagsBits.AttachFiles,
+              PermissionFlagsBits.ReadMessageHistory,
+            ],
+          },
+        ],
+      });
+      if (created) targetChannelId = created.id;
+    } catch (err) {
+      console.warn("Could not auto-create treasury-review channel:", err?.message ?? err);
+    }
+  }
+
   let bytes;
   try {
     const response = await fetch(attachment.url, { signal: AbortSignal.timeout(10_000) });
@@ -374,22 +415,29 @@ export async function submitTreasuryPayment(db, interaction, { reviewChannelId, 
   } finally { tx.close(); }
   const result = await db.execute({ sql: "SELECT * FROM treasury_submissions WHERE reference = ?", args: [reference] });
   const row = result.rows[0];
-  try {
-    const channel = await interaction.client.channels.fetch(reviewChannelId);
-    const guild = interaction.guild;
-    const botMember = guild?.members?.me;
-    if (!guild || channel?.guildId !== guild.id || ![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)) throw new Error("Treasury review channel must be a text channel in the submitting server");
-    if (channel.permissionsFor(guild.roles.everyone)?.has(PermissionFlagsBits.ViewChannel)) throw new Error("Treasury review channel is visible to everyone");
-    const botPermissions = botMember && channel.permissionsFor(botMember);
-    if (!botPermissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles])) throw new Error("Bot lacks required permissions in treasury review channel");
-    const configuredRoles = reviewerRoleIds.split(",").map((id) => guild.roles.cache.get(id.trim())).filter(Boolean);
-    if (configuredRoles.length && !configuredRoles.some((role) => channel.permissionsFor(role)?.has(PermissionFlagsBits.ViewChannel))) throw new Error("No configured reviewer role can view the treasury review channel");
-    await channel.send({ embeds: [makeReviewEmbed(row)], files: [{ attachment: bytes, name: attachment.name }], components: reviewComponents(reference) });
-  } catch (error) {
-    console.error("Could not post treasury review item:", error);
+
+  if (targetChannelId) {
+    try {
+      const channel = await interaction.client.channels.fetch(targetChannelId);
+      const guild = interaction.guild;
+      const botMember = guild?.members?.me;
+      if (!guild || channel?.guildId !== guild.id || ![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)) throw new Error("Treasury review channel must be a text channel in the submitting server");
+      if (channel.permissionsFor && channel.permissionsFor(guild.roles.everyone)?.has(PermissionFlagsBits.ViewChannel)) throw new Error("Treasury review channel is visible to everyone");
+      const botPermissions = botMember && channel.permissionsFor && channel.permissionsFor(botMember);
+      if (botPermissions && !botPermissions.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles])) throw new Error("Bot lacks required permissions in treasury review channel");
+      const configuredRoles = reviewerRoleIds ? reviewerRoleIds.split(",").map((id) => guild.roles.cache?.get?.(id.trim())).filter(Boolean) : [];
+      if (configuredRoles.length && !configuredRoles.some((role) => channel.permissionsFor(role)?.has(PermissionFlagsBits.ViewChannel))) throw new Error("No configured reviewer role can view the treasury review channel");
+      await channel.send({ embeds: [makeReviewEmbed(row)], files: [{ attachment: bytes, name: attachment.name }], components: reviewComponents(reference) });
+    } catch (error) {
+      console.error("Could not post treasury review item:", error);
+      await db.execute({ sql: "UPDATE treasury_submissions SET status='NEEDS_REVIEW', updated_at=CURRENT_TIMESTAMP WHERE reference=? AND status='PENDING'", args: [reference] });
+      await audit(db, reference, interaction.user.id, "REVIEW_CHANNEL_DELIVERY_FAILED", status, "NEEDS_REVIEW", "Could not deliver review message");
+      return interaction.editReply(`Receipt ${reference} is recorded as NEEDS_REVIEW, but the review channel could not be notified. Please contact treasury staff.`);
+    }
+  } else {
     await db.execute({ sql: "UPDATE treasury_submissions SET status='NEEDS_REVIEW', updated_at=CURRENT_TIMESTAMP WHERE reference=? AND status='PENDING'", args: [reference] });
-    await audit(db, reference, interaction.user.id, "REVIEW_CHANNEL_DELIVERY_FAILED", status, "NEEDS_REVIEW", "Could not deliver review message");
-    return interaction.editReply(`Receipt ${reference} is recorded as NEEDS_REVIEW, but the review channel could not be notified. Please contact treasury staff.`);
+    await audit(db, reference, interaction.user.id, "NO_REVIEW_CHANNEL_CONFIGURED", status, "NEEDS_REVIEW", "No review channel configured");
+    return interaction.editReply(`Receipt **${reference}** has been recorded for review. (A dedicated #treasury-review channel is not yet configured on this server; treasury staff can review via the ledger).`);
   }
   await interaction.editReply(buildAmountCheckerMessage({
     comparison: row.amount_comparison ?? analysis.amountCheck?.comparison ?? AMOUNT_NEEDS_REVIEW,

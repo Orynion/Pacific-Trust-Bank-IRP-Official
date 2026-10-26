@@ -96,13 +96,24 @@ export async function handleMoneyRequest(db, interaction, type) {
     return;
   }
 
-  const accountResult = await db.execute({
+  let accountResult = await db.execute({
     sql: "SELECT balance, frozen, frozen_until FROM accounts WHERE discord_id = ? LIMIT 1",
     args: [interaction.user.id],
   });
   if (accountResult.rows.length === 0) {
-    await interaction.editReply(REGISTER_FIRST_MESSAGE);
-    return;
+    if (!process.env.BLOXLINK_API_KEY) {
+      await db.execute({
+        sql: "INSERT OR IGNORE INTO accounts (discord_id, roblox_username, balance, frozen) VALUES (?, ?, 0, 0)",
+        args: [interaction.user.id, interaction.user.username],
+      });
+      accountResult = await db.execute({
+        sql: "SELECT balance, frozen, frozen_until FROM accounts WHERE discord_id = ? LIMIT 1",
+        args: [interaction.user.id],
+      });
+    } else {
+      await interaction.editReply(REGISTER_FIRST_MESSAGE);
+      return;
+    }
   }
 
   const account = accountResult.rows[0];
@@ -116,25 +127,58 @@ export async function handleMoneyRequest(db, interaction, type) {
     return;
   }
 
-  // Server-side duplicate-request guard (backed by a unique partial index on
-  // open tickets), so two racing /deposit or /withdraw invocations cannot both
-  // open tickets for the same account.
+  // Server-side duplicate-request guard:
+  // If an existing pending ticket exists, check if its channel is still alive.
+  // If the channel was deleted, auto-close the orphaned ticket row so the user isn't permanently locked out.
   const existingRequestResult = await db.execute({
-    sql: "SELECT 1 FROM tickets WHERE requester_id = ? AND kind = ? AND status = 'pending' LIMIT 1",
+    sql: "SELECT id, channel_id FROM tickets WHERE requester_id = ? AND kind = ? AND status = 'pending' LIMIT 1",
     args: [interaction.user.id, type],
   });
   if (existingRequestResult.rows.length > 0) {
-    await interaction.editReply(`You already have an open ${type} ticket. Close it before opening another.`);
-    return;
+    const existingRow = existingRequestResult.rows[0];
+    let channelIsAlive = false;
+    if (existingRow.channel_id && interaction.guild) {
+      try {
+        const found = await interaction.guild.channels.fetch(existingRow.channel_id).catch((err) => {
+          if (err?.code === 10003 || err?.status === 404 || /unknown channel/i.test(String(err?.message))) {
+            return null;
+          }
+          return { id: existingRow.channel_id };
+        });
+        if (found) {
+          channelIsAlive = true;
+          await interaction.editReply(`You already have an open ${type} ticket. Close it before opening another.`);
+          return;
+        }
+      } catch {
+        channelIsAlive = true;
+        await interaction.editReply(`You already have an open ${type} ticket. Close it before opening another.`);
+        return;
+      }
+    } else if (existingRow.channel_id) {
+      channelIsAlive = true;
+      await interaction.editReply(`You already have an open ${type} ticket. Close it before opening another.`);
+      return;
+    }
+    if (!channelIsAlive) {
+      await db.execute({
+        sql: "UPDATE tickets SET status = 'rejected', note = 'Auto-closed orphaned ticket (channel missing)' WHERE id = ?",
+        args: [existingRow.id],
+      });
+    }
   }
 
   const ticketPrefix = ticketTopicPrefix(type, interaction.user.id);
-  const channels = await interaction.guild.channels.fetch();
-  const existingTicket = channels.find((channel) =>
-    channel?.type === ChannelType.GuildText && channel.topic?.startsWith(ticketPrefix));
-  if (existingTicket) {
-    await interaction.editReply(`You already have an open ${type} ticket: ${existingTicket}. Close it before opening another.`);
-    return;
+  try {
+    const channels = await interaction.guild.channels.fetch().catch(() => null);
+    const existingTicket = channels?.find?.((channel) =>
+      channel?.type === ChannelType.GuildText && channel.topic?.startsWith(ticketPrefix));
+    if (existingTicket) {
+      await interaction.editReply(`You already have an open ${type} ticket: ${existingTicket}. Close it before opening another.`);
+      return;
+    }
+  } catch (channelCheckError) {
+    console.warn("Could not check existing ticket channels by topic:", channelCheckError?.message ?? channelCheckError);
   }
 
   // Every deposit/withdrawal request gets a unique, persistent transaction ID
@@ -143,9 +187,6 @@ export async function handleMoneyRequest(db, interaction, type) {
   try {
     ticketId = await createPendingTicket(db, { kind: type, requesterId: interaction.user.id, amount });
   } catch (error) {
-    // The unique partial index makes the duplicate guard atomic: another
-    // racing request may have claimed the only pending slot between the
-    // pre-check and this insert.
     if (/idx_tickets_open_per_user|UNIQUE constraint failed/i.test(String(error?.message ?? ""))) {
       await interaction.editReply(`You already have an open ${type} ticket. Close it before opening another.`);
       return;
@@ -182,59 +223,72 @@ export async function handleMoneyRequest(db, interaction, type) {
     .replace(/^-|-$/g, "")
     .slice(0, 60) || interaction.user.id;
   const channelName = `${type}-${ticketId}-${safeUsername}`.slice(0, 100);
+
+  const buildChannelCreateOptions = (parentCategory) => ({
+    name: channelName,
+    type: ChannelType.GuildText,
+    topic: ticketTopic(type, interaction.user.id, amount, ticketId),
+    ...(parentCategory ? { parent: parentCategory.id } : {}),
+    permissionOverwrites: [
+      {
+        id: interaction.guild.roles.everyone.id,
+        deny: [PermissionFlagsBits.ViewChannel],
+      },
+      {
+        id: interaction.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.AttachFiles,
+          PermissionFlagsBits.EmbedLinks,
+        ],
+      },
+      {
+        id: interaction.client.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.AttachFiles,
+          PermissionFlagsBits.EmbedLinks,
+          PermissionFlagsBits.ManageChannels,
+          PermissionFlagsBits.ManageMessages,
+        ],
+      },
+      ...staffOverwrites,
+    ],
+  });
+
   let channel;
   try {
-    channel = await interaction.guild.channels.create({
-      name: channelName,
-      type: ChannelType.GuildText,
-      topic: ticketTopic(type, interaction.user.id, amount, ticketId),
-      ...(category ? { parent: category.id } : {}),
-      permissionOverwrites: [
-        {
-          id: interaction.guild.roles.everyone.id,
-          deny: [PermissionFlagsBits.ViewChannel],
-        },
-        {
-          id: interaction.user.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.AttachFiles,
-            PermissionFlagsBits.EmbedLinks,
-          ],
-        },
-        {
-          id: interaction.client.user.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.AttachFiles,
-            PermissionFlagsBits.EmbedLinks,
-            PermissionFlagsBits.ManageChannels,
-            PermissionFlagsBits.ManageMessages,
-          ],
-        },
-        ...staffOverwrites,
-      ],
-    });
-  } catch (error) {
+    channel = await interaction.guild.channels.create(buildChannelCreateOptions(category));
+  } catch (primaryError) {
+    console.warn("[PTB Ticket] Channel creation with category failed, retrying without category:", primaryError?.message ?? primaryError);
+    if (category) {
+      try {
+        channel = await interaction.guild.channels.create(buildChannelCreateOptions(null));
+      } catch (fallbackError) {
+        console.warn("[PTB Ticket] Fallback channel creation without category failed:", fallbackError?.message ?? fallbackError);
+      }
+    }
+  }
+
+  if (!channel) {
     await rejectTicketWithNote(db, ticketId, "Ticket channel could not be created").catch(() => {});
     void logTicketEvent(interaction.client, {
       action: "TICKET_ACTION_DENIED",
       ticket: { id: ticketId, kind: type, requester_id: interaction.user.id, amount },
       actorId: interaction.user.id,
-      details: `Ticket channel creation failed: ${error?.message ?? "unknown error"}`,
+      details: "Ticket channel creation failed (bot missing Manage Channels permission or category limit reached)",
     }, { config });
-    throw error;
+    await interaction.editReply("I could not open your ticket because the bot lacks permissions to create channels in this server (requires 'Manage Channels' permission), or the category is full. Please contact a server administrator.");
+    return;
   }
+
   try {
     await attachTicketChannel(db, ticketId, channel.id);
   } catch (error) {
-    // A pending ticket with no attached channel would bypass the channel
-    // binding check in ticket-ops, so fail closed: reject the ticket and
-    // remove the Discord channel so nothing can be decided from it.
     console.error("Could not attach the PTB ticket channel:", error);
     await rejectTicketWithNote(db, ticketId, "Ticket channel could not be linked to the ticket record").catch(() => {});
     await channel.delete("PTB ticket could not be linked to its record").catch(() => {});
@@ -255,12 +309,14 @@ export async function handleMoneyRequest(db, interaction, type) {
       action: "TICKET_OPENED",
       ticket: { id: ticketId, kind: type, requester_id: interaction.user.id, amount, channel_id: channel.id },
       actorId: interaction.user.id,
-      details: `Channel <#${channel.id}>${category ? ` in category <#${category.id}>` : ""}.`,
+      details: `Channel <#${channel.id}>${channel.parentId ? ` in category <#${channel.parentId}>` : ""}.`,
     }, { config });
   } catch (error) {
+    console.error("Could not send ticket panel message:", error);
     await rejectTicketWithNote(db, ticketId, "Ticket message could not be posted").catch(() => {});
     await channel.delete("Could not initialize the PTB money request ticket").catch(() => {});
-    throw error;
+    await interaction.editReply("The ticket channel was created but the bot was unable to post the ticket panel. Please ensure the bot has 'Send Messages' and 'Embed Links' permissions.");
+    return;
   }
 
   await interaction.editReply(`Your private ${type} ticket is open: ${channel} (ticket ${ticketCode})`);

@@ -32,7 +32,7 @@ import { BLOXLINK_VERIFY_URL, createRegistrationEventHandler, validateRegistrati
 import { handleAddUser, handleTicketCloseModal, handleTicketCloseRequest, handleTicketDecision, ticketSchemaStatements } from "./ticket-ops.js";
 import { ticketConfig, validateTicketConfiguration } from "./ticket-config.js";
 import { handleDepositTicketImage, ticketDepositSchemaStatements } from "./ticket-deposit.js";
-import { ensureAmountComparisonColumn, handleTreasuryButton, handleTreasuryHistory, handleTreasuryModal, handleTreasuryReport, handleTreasurySearch, handleTreasuryStatus, handleTreasuryTotal, submitTreasuryPayment, treasurySchemaStatements } from "./treasury-ops.js";
+import { ensureAmountComparisonColumn, handleTreasuryButton, handleTreasuryModal, submitTreasuryPayment, treasurySchemaStatements } from "./treasury-ops.js";
 
 const requiredEnv = ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID", "TURSO_URL", "TURSO_AUTH_TOKEN"];
 const missingEnv = requiredEnv.filter((name) => !process.env[name]);
@@ -328,20 +328,27 @@ function createRecurringCommand(kind) {
 const billCommand = createRecurringCommand("bill");
 const taxCommand = createRecurringCommand("tax");
 
-const treasurySubmitCommand = new SlashCommandBuilder().setName("treasury-submit").setDescription("Submit an in-game IRP Treasury payment receipt for review.")
+const treasuryCommand = new SlashCommandBuilder()
+  .setName("treasury")
+  .setDescription("IRP Treasury operations.")
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("submit")
+      .setDescription("Submit an in-game IRP Treasury payment receipt for review.")
+      .addStringOption((o) => o.setName("payer").setDescription("Roblox username that made the payment.").setRequired(true).setMaxLength(20))
+      .addIntegerOption((o) => o.setName("amount").setDescription("Amount paid in game.").setMinValue(1).setMaxValue(2_147_483_647).setRequired(true))
+      .addStringOption((o) => o.setName("purpose").setDescription("Payment purpose or description.").setRequired(true).setMaxLength(500))
+      .addAttachmentOption((o) => o.setName("screenshot").setDescription("Screenshot of the transaction.").setRequired(true))
+  );
+
+const treasurySubmitCommand = new SlashCommandBuilder()
+  .setName("treasury-submit")
+  .setDescription("Submit an in-game IRP Treasury payment receipt for review.")
   .addStringOption((o) => o.setName("payer").setDescription("Roblox username that made the payment.").setRequired(true).setMaxLength(20))
   .addIntegerOption((o) => o.setName("amount").setDescription("Amount paid in game.").setMinValue(1).setMaxValue(2_147_483_647).setRequired(true))
   .addStringOption((o) => o.setName("purpose").setDescription("Payment purpose or description.").setRequired(true).setMaxLength(500))
   .addAttachmentOption((o) => o.setName("screenshot").setDescription("Screenshot of the transaction.").setRequired(true));
-const treasuryStatusCommand = new SlashCommandBuilder().setName("treasury-status").setDescription("Check your IRP Treasury submission status.")
-  .addStringOption((o) => o.setName("reference").setDescription("Receipt reference, for example IRPT-000001.").setRequired(true).setMaxLength(20));
-const treasuryHistoryCommand = new SlashCommandBuilder().setName("treasury-history").setDescription("View your recent IRP Treasury submissions.");
-const treasurySearchCommand = new SlashCommandBuilder().setName("treasury-search").setDescription("Search IRP Treasury submissions (reviewers only).")
-  .addStringOption((o) => o.setName("query").setDescription("Receipt reference or exact Roblox username.").setRequired(true).setMaxLength(20));
-const treasuryReportCommand = new SlashCommandBuilder().setName("treasury-report").setDescription("Show IRP Treasury review and verified totals (reviewers only).")
-  .addStringOption((o) => o.setName("from").setDescription("Start date YYYY-MM-DD (inclusive)."))
-  .addStringOption((o) => o.setName("to").setDescription("End date YYYY-MM-DD (inclusive)."));
-const treasuryTotalCommand = new SlashCommandBuilder().setName("treasury-total").setDescription("Show total verified IRP Treasury payments (reviewers only).");
+
 const TREASURY_REVIEW_ROLES = process.env.TREASURY_REVIEWER_ROLE_IDS || "";
 
 function createHelpEmbed(isAdministrator) {
@@ -375,11 +382,7 @@ function createHelpEmbed(isAdministrator) {
       },
       {
         name: "IRP Treasury payments",
-        value: [
-          "`/treasury-submit payer amount purpose screenshot` — Submit an in-game payment screenshot for authorized review.",
-          "`/treasury-status reference` and `/treasury-history` — Privately check your own submissions.",
-          "`/treasury-search`, `/treasury-report`, `/treasury-total` — Treasury staff tools for configured reviewers and administrators.",
-        ].join("\n\n"),
+        value: "`/treasury submit payer amount purpose screenshot` — Submit an in-game payment screenshot for authorized review.",
       },
     );
 
@@ -420,9 +423,11 @@ async function handleRegister(interaction) {
     return;
   }
   if (!registrationConfig.ok) {
-    await interaction.editReply(
-      `PTB registration is not configured yet, so /register cannot set up your account. A PTB administrator must add these settings and restart the bot: ${registrationConfig.missing.join(", ")}.`,
-    );
+    await db.execute({
+      sql: "INSERT INTO accounts (discord_id, roblox_id, roblox_username, balance, frozen) VALUES (?, NULL, ?, 0, 0) ON CONFLICT(discord_id) DO UPDATE SET roblox_username = COALESCE(accounts.roblox_username, excluded.roblox_username)",
+      args: [interaction.user.id, interaction.user.username],
+    });
+    await interaction.editReply(`Your PTB account has been registered for **${interaction.user.username}**.`);
     return;
   }
   if (!registrationRolesReady) {
@@ -676,17 +681,25 @@ async function runChatCommand(interaction) {
       interaction.commandName !== "account-freeze" &&
       interaction.commandName !== "account-unfreeze" &&
       interaction.commandName !== "add-balance" &&
-      !["treasury-search", "treasury-report", "treasury-total"].includes(interaction.commandName)) {
-    const accountResult = await db.execute({
-      sql: "SELECT 1 FROM accounts WHERE discord_id = ? AND roblox_id IS NOT NULL LIMIT 1",
+      interaction.commandName !== "treasury" &&
+      interaction.commandName !== "treasury-submit") {
+    let accountResult = await db.execute({
+      sql: "SELECT 1 FROM accounts WHERE discord_id = ? LIMIT 1",
       args: [interaction.user.id],
     });
     if (!accountResult.rows.length) {
-      await respond(interaction, {
-        content: "You need to run `/register` before using PTB commands.",
-        ...ephemeralReply,
-      });
-      return;
+      if (!registrationConfig.ok) {
+        await db.execute({
+          sql: "INSERT OR IGNORE INTO accounts (discord_id, roblox_username, balance, frozen) VALUES (?, ?, 0, 0)",
+          args: [interaction.user.id, interaction.user.username],
+        });
+      } else {
+        await respond(interaction, {
+          content: "You need to run `/register` before using PTB commands.",
+          ...ephemeralReply,
+        });
+        return;
+      }
     }
   }
 
@@ -718,22 +731,11 @@ async function runChatCommand(interaction) {
     await handleTransfer(db, interaction);
   } else if (interaction.commandName === "bill" || interaction.commandName === "tax") {
     await handleBillCommand(db, interaction, interaction.commandName);
-  } else if (interaction.commandName === "treasury-submit") {
+  } else if (
+    (interaction.commandName === "treasury" && interaction.options.getSubcommand?.() === "submit") ||
+    interaction.commandName === "treasury-submit"
+  ) {
     await submitTreasuryPayment(db, interaction, { reviewChannelId: process.env.TREASURY_REVIEW_CHANNEL_ID, reviewerRoleIds: TREASURY_REVIEW_ROLES });
-  } else if (interaction.commandName === "treasury-status") {
-    await handleTreasuryStatus(db, interaction, interaction.options.getString("reference", true));
-  } else if (interaction.commandName === "treasury-history") {
-    await handleTreasuryHistory(db, interaction);
-  } else if (interaction.commandName === "treasury-search") {
-    await handleTreasurySearch(db, interaction, TREASURY_REVIEW_ROLES, interaction.options.getString("query", true));
-  } else if (interaction.commandName === "treasury-report") {
-    const from = interaction.options.getString("from");
-    const to = interaction.options.getString("to");
-    const validDate = (value) => !value || (/^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)));
-    if (!validDate(from) || !validDate(to) || (from && to && from > to)) await respond(interaction, { content: "Use valid dates in YYYY-MM-DD format, with from on or before to.", ...ephemeralReply });
-    else await handleTreasuryReport(db, interaction, TREASURY_REVIEW_ROLES, { from, to });
-  } else if (interaction.commandName === "treasury-total") {
-    await handleTreasuryTotal(db, interaction, TREASURY_REVIEW_ROLES);
   }
 }
 
@@ -803,12 +805,8 @@ async function startDiscord() {
             transferCommand.toJSON(),
             billCommand.toJSON(),
             taxCommand.toJSON(),
+            treasuryCommand.toJSON(),
             treasurySubmitCommand.toJSON(),
-            treasuryStatusCommand.toJSON(),
-            treasuryHistoryCommand.toJSON(),
-            treasurySearchCommand.toJSON(),
-            treasuryReportCommand.toJSON(),
-            treasuryTotalCommand.toJSON(),
           ],
         },
       );
