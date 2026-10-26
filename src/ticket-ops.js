@@ -60,7 +60,7 @@ export function ticketPanelPayload({ ticket, type, amount, balance, requester, c
   const isDeposit = type === "deposit";
 
   return {
-    content: `Welcome ${requester}, your private ${type} ticket is ready.`,
+    content: `${requester}, your ${type} ticket is ready!`,
     embeds: [buildTicketWelcomeEmbed({ ticket, type, amount, balance, requester })],
     components: [
       new ActionRowBuilder().addComponents(
@@ -336,7 +336,7 @@ export async function handleTicketDecision(db, interaction, action, ticketIdRaw)
           ? " Next step: use **Credit & finalise** to credit the requester."
           : " Next step: use **Mark paid & deduct balance** once the in-game payout has been delivered.";
         await interaction.reply({
-          content: `${code} approved by the admin. The ticket is now **approved**, funds have **not** moved yet.${nextStepHint}`,
+          content: `${code}: The ticket is verified by an admin, although no changes to your balance were made.${nextStepHint}`,
         });
         return;
       }
@@ -384,7 +384,7 @@ export async function handleTicketDecision(db, interaction, action, ticketIdRaw)
           statusAfter: "rejected",
         }, { config: ticketConfig() });
         await interaction.reply({
-          content: `${code} rejected by the admin. No balance changes were made.`,
+          content: `${code} rejected by admin. Your balance was not updated.`,
         });
         return;
       }
@@ -431,7 +431,7 @@ export async function handleTicketDecision(db, interaction, action, ticketIdRaw)
       if (ticket.status === "completed") {
         await transaction.rollback();
         await interaction.reply({
-          content: `${code} was already completed by ${ticket.completion_by ? `<@${ticket.completion_by}>` : "an administrator"}${ticket.completion_at ? ` (at ${ticket.completion_at} UTC)` : ""}. Funds moved exactly once (ledger entry ${ticket.ledger_id ? `#${ticket.ledger_id}` : "released"}).`,
+          content: `${code} was already completed by ${ticket.completion_by ? `<@${ticket.completion_by}>` : "an administrator"}${ticket.completion_at ? ` (at ${ticket.completion_at} UTC)` : ""}. Funds moved exactly once (transaction #${ticket.ledger_id ? ticket.ledger_id : "completed"}).`,
           ...ephemeralReply,
         });
         return;
@@ -543,7 +543,7 @@ export async function handleTicketDecision(db, interaction, action, ticketIdRaw)
         ? `credited ${ticket.amount.toLocaleString()} to <@${ticket.requester_id}>`
         : `paid out ${ticket.amount.toLocaleString()} from <@${ticket.requester_id}>`;
       await interaction.reply({
-        content: `${code} completed: ${happened}. New balance: ${newBalance.toLocaleString()}. Ledger entry ${ledgerNote} (#${ledgerId}).`,
+        content: `${code} completed: ${happened}. New balance: ${newBalance.toLocaleString()}. Ticket ${code} ${ticket.kind === "deposit" ? "deposit credited" : "payout processed"} (#${ledgerId}).`,
       });
       return;
     }
@@ -576,7 +576,42 @@ async function recordTicketClosure(db, ticket, { actorId, reason }) {
   });
 }
 
-async function performTicketClose(db, interaction, ticket, { reason = "", config = ticketConfig() } = {}) {
+export async function runTicketCloseCountdown(channel, {
+  seconds = 5,
+  intervalMs = (process.env.NODE_ENV === "test" || process.env.npm_lifecycle_event === "test" || process.argv.includes("--test")) ? 0 : 1000,
+} = {}) {
+  if (!channel || typeof channel.send !== "function" || seconds <= 0) return;
+
+  let message = null;
+  try {
+    message = await channel.send(`This ticket will be deleted in ${seconds}...`);
+  } catch (error) {
+    console.warn("[PTB Ticket] Could not post ticket deletion countdown:", error?.message ?? error);
+    return;
+  }
+
+  for (let count = seconds - 1; count >= 1; count--) {
+    if (intervalMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    const text = `This ticket will be deleted in ${count}...`;
+    try {
+      if (message && typeof message.edit === "function") {
+        await message.edit(text);
+      } else {
+        await channel.send(text);
+      }
+    } catch (editError) {
+      console.warn(`[PTB Ticket] Could not update deletion countdown to ${count}:`, editError?.message ?? editError);
+    }
+  }
+
+  if (intervalMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+async function performTicketClose(db, interaction, ticket, { reason = "", config = ticketConfig(), countdownSeconds = 5, countdownIntervalMs } = {}) {
   const statusBefore = ticket.status;
   await interaction.deferReply(ephemeralReply);
 
@@ -597,6 +632,15 @@ async function performTicketClose(db, interaction, ticket, { reason = "", config
     await recordTicketClosure(db, ticket, { actorId: interaction.user.id, reason });
   } catch (error) {
     console.error(`Could not record closure of ${ticketCode(ticket)}:`, error);
+  }
+
+  try {
+    await runTicketCloseCountdown(interaction.channel, {
+      seconds: countdownSeconds,
+      ...(countdownIntervalMs !== undefined ? { intervalMs: countdownIntervalMs } : {}),
+    });
+  } catch (countdownError) {
+    console.warn(`[PTB Ticket] Countdown error before closing ${ticketCode(ticket)}:`, countdownError?.message ?? countdownError);
   }
 
   let deleted = false;

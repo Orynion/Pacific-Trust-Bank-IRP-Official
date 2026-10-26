@@ -25,10 +25,10 @@ export const PTB_COLORS = Object.freeze({
  * Standard PTB Footers
  */
 export const PTB_FOOTERS = Object.freeze({
-  STANDARD: "Pacific Trust Bank • Roleplay ledger only; no real money is moved.",
+  STANDARD: "Pacific Trust Bank • No real money is moved.",
   ADVISORY_RECEIPT: "Receipt analysis only · no balance changes or automatic approvals",
   AUDIT_LOG: "Pacific Trust Bank • Staff Audit Record",
-  BALANCE: "Private ledger balance · Roleplay only",
+  BALANCE: "Private ledger balance",
 });
 
 /**
@@ -297,7 +297,7 @@ export function buildErrorEmbed(titleOrOptions, optionalDescription) {
  */
 export function buildTicketPanelEmbed(options = {}) {
   const title = options.title || "🏦 Pacific Trust Bank | Transaction Requests";
-  const description = options.description || "Welcome to Pacific Trust Bank. Open a private ticket below to request an account deposit or withdrawal. All transactions are recorded in the PTB roleplay ledger.";
+  const description = options.description || "Welcome to Pacific Trust Bank. Open a private ticket below to request an account deposit or withdrawal. All transactions are recorded in the PTB ledger.";
 
   return buildPtbEmbed({
     title,
@@ -314,7 +314,7 @@ export function buildTicketPanelEmbed(options = {}) {
       },
       {
         name: "ℹ️ Roleplay Ledger Notice",
-        value: options.roleplayNotice || "PTB is a roleplay bank ledger for Emergency Hamburg RP. No real money is transferred. Ledger updates are verified and finalized by authorized staff only.",
+        value: options.roleplayNotice || "PTB is a bank ledger for Emergency Hamburg RP. No real money is transferred. Ledger updates are verified and finalized by authorized staff only.",
       },
       ...(Array.isArray(options.extraFields) ? options.extraFields : []),
     ],
@@ -545,13 +545,13 @@ export function buildDepositAnalysisEmbed(result, context = {}) {
     { name: "Receipt Status", value: paymentStatus ? `${paymentStatus} (read from screenshot)` : notDetected, inline: true },
     { name: "Payment Method", value: paymentMethod || notDetected, inline: true },
     { name: "OCR Confidence", value: confidenceDisplay, inline: true },
-    { name: "Verified Payment Status", value: "🟡 Unverified (pending staff approval)", inline: true },
+    { name: "Verified Payment Status", value: "🟡 Pending staff approval", inline: true },
   );
 
   return buildPtbEmbed({
     color: embedColor,
     title,
-    description: "Automated screenshot checks are advisory. Information extracted from screenshot OCR is unverified and does not establish that a transaction occurred. Authorized staff review is required before approving this deposit.",
+    description: "Automated screenshot checks are advisory. Information extracted from screenshot OCR is unverified it could be unreliable and we do not hide that. Nothing was changed in your balance",
     fields: embedFields,
     footer: PTB_FOOTERS.ADVISORY_RECEIPT,
   });

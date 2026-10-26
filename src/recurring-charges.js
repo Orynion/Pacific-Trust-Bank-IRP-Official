@@ -26,7 +26,7 @@ const ephemeral = { flags: MessageFlags.Ephemeral };
 const chargeColor = 0x0B3D2E;
 function chargeEmbed(title, description, color = chargeColor) {
   return new EmbedBuilder().setColor(color).setTitle(title).setDescription(description)
-    .setFooter({ text: "Pacific Trust Bank · Roleplay ledger only" });
+    .setFooter({ text: "Pacific Trust Bank" });
 }
 const addInterval = (date, interval) => {
   const next = new Date(date);

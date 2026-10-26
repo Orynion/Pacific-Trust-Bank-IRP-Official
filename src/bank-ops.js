@@ -30,6 +30,7 @@ export const schemaStatements = [
     roblox_username TEXT,
     balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
     frozen INTEGER NOT NULL DEFAULT 0 CHECK (frozen IN (0, 1)),
+    frozen_until TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE TABLE IF NOT EXISTS transactions (
@@ -61,6 +62,25 @@ export function validateMoneyAmount(amount) {
   return { ok: true };
 }
 
+export function isAccountFrozen(account, now = new Date()) {
+  if (!account || Number(account.frozen) !== 1) return false;
+  if (!account.frozen_until) return true;
+  const until = new Date(account.frozen_until);
+  if (Number.isNaN(until.getTime())) return true;
+  return now < until;
+}
+
+export async function ensureFrozenUntilColumn(db) {
+  try {
+    await db.execute("ALTER TABLE accounts ADD COLUMN frozen_until TEXT");
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    if (!/duplicate column|already exists/i.test(message)) {
+      console.warn("PTB frozen_until column migration note:", message);
+    }
+  }
+}
+
 export async function handleMoneyRequest(db, interaction, type) {
   const amount = interaction.options.getInteger("amount", true);
   await interaction.deferReply(ephemeralReply);
@@ -77,7 +97,7 @@ export async function handleMoneyRequest(db, interaction, type) {
   }
 
   const accountResult = await db.execute({
-    sql: "SELECT balance, frozen FROM accounts WHERE discord_id = ? LIMIT 1",
+    sql: "SELECT balance, frozen, frozen_until FROM accounts WHERE discord_id = ? LIMIT 1",
     args: [interaction.user.id],
   });
   if (accountResult.rows.length === 0) {
@@ -87,7 +107,7 @@ export async function handleMoneyRequest(db, interaction, type) {
 
   const account = accountResult.rows[0];
   const balance = Number(account.balance);
-  if (Number(account.frozen) === 1) {
+  if (isAccountFrozen(account)) {
     await interaction.editReply("Your PTB account is frozen, so you cannot open a deposit or withdrawal request right now.");
     return;
   }
@@ -131,7 +151,7 @@ export async function handleMoneyRequest(db, interaction, type) {
       return;
     }
     console.error("Could not create the PTB ticket record:", error);
-    await interaction.editReply("I could not open the ticket right now because the ledger database rejected it. Please try again shortly.");
+    await interaction.editReply("I could not open the ticket right now because the database rejected it. Please try again shortly.");
     return;
   }
   const ticketCode = formatTicketCode({ kind: type, id: ticketId });
@@ -218,7 +238,7 @@ export async function handleMoneyRequest(db, interaction, type) {
     console.error("Could not attach the PTB ticket channel:", error);
     await rejectTicketWithNote(db, ticketId, "Ticket channel could not be linked to the ticket record").catch(() => {});
     await channel.delete("PTB ticket could not be linked to its record").catch(() => {});
-    await interaction.editReply("I could not open the ticket right now because the ledger database rejected it. Please try again shortly.");
+    await interaction.editReply("I could not open the ticket right now because the database rejected it. Please try again shortly.");
     return;
   }
 
@@ -266,7 +286,7 @@ export async function handleBalance(db, interaction) {
       .setColor(0x0B3D2E)
       .setTitle("Pacific Trust Bank | Account Balance")
       .setDescription(`**${balance.toLocaleString()}**`)
-      .setFooter({ text: "Private ledger balance · Roleplay only" })],
+      .setFooter({ text: "Account balance" })],
     ...ephemeralReply,
   });
 }
@@ -337,7 +357,7 @@ export async function handleTransfer(db, interaction) {
     });
 
     const senderResult = await transaction.execute({
-      sql: "SELECT balance, frozen FROM accounts WHERE discord_id = ? LIMIT 1",
+      sql: "SELECT balance, frozen, frozen_until FROM accounts WHERE discord_id = ? LIMIT 1",
       args: [interaction.user.id],
     });
     if (senderResult.rows.length === 0) {
@@ -350,7 +370,7 @@ export async function handleTransfer(db, interaction) {
     }
 
     const senderRow = senderResult.rows[0];
-    if (Number(senderRow.frozen) === 1) {
+    if (isAccountFrozen(senderRow)) {
       await transaction.rollback();
       await interaction.reply({
         content: "Your account is frozen. You cannot transfer money.",
@@ -370,7 +390,7 @@ export async function handleTransfer(db, interaction) {
     }
 
     const targetResult = await transaction.execute({
-      sql: "SELECT balance, frozen FROM accounts WHERE discord_id = ? LIMIT 1",
+      sql: "SELECT balance, frozen, frozen_until FROM accounts WHERE discord_id = ? LIMIT 1",
       args: [target.id],
     });
     if (targetResult.rows.length === 0) {
@@ -383,7 +403,7 @@ export async function handleTransfer(db, interaction) {
     }
 
     const targetRow = targetResult.rows[0];
-    if (Number(targetRow.frozen) === 1) {
+    if (isAccountFrozen(targetRow)) {
       await transaction.rollback();
       await interaction.reply({
         content: `${target.username}'s account is frozen and cannot receive transfers.`,
@@ -554,3 +574,124 @@ export async function handleAddBalance(db, interaction) {
     transaction.close();
   }
 }
+
+export async function handleAccountFreeze(db, interaction) {
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+    await interaction.reply({ content: "Only server administrators can use this command.", ...ephemeralReply });
+    return;
+  }
+
+  const target = interaction.options.getUser("user", true);
+  const duration = interaction.options.getInteger("duration", true);
+  const confirm = interaction.options.getBoolean("confirm", true);
+
+  if (!confirm) {
+    await interaction.reply({
+      content: "Freeze cancelled. You must set confirm to True to freeze an account.",
+      ...ephemeralReply,
+    });
+    return;
+  }
+
+  if (target.bot) {
+    await interaction.reply({
+      content: "Bots cannot have accounts.",
+      ...ephemeralReply,
+    });
+    return;
+  }
+
+  if (duration < 1 || duration > 7) {
+    await interaction.reply({
+      content: "Duration must be between 1 and 7 days.",
+      ...ephemeralReply,
+    });
+    return;
+  }
+
+  await ensureFrozenUntilColumn(db);
+
+  const accountResult = await db.execute({
+    sql: "SELECT discord_id, balance, frozen, frozen_until FROM accounts WHERE discord_id = ? LIMIT 1",
+    args: [target.id],
+  });
+
+  if (accountResult.rows.length === 0) {
+    await interaction.reply({
+      content: `${target.username} does not have a registered PTB account.`,
+      ...ephemeralReply,
+    });
+    return;
+  }
+
+  const freezeExpiry = new Date(Date.now() + duration * 24 * 60 * 60 * 1000);
+  const freezeUntilIso = freezeExpiry.toISOString();
+  const unixTimestamp = Math.floor(freezeExpiry.getTime() / 1000);
+
+  await db.execute({
+    sql: "UPDATE accounts SET frozen = 1, frozen_until = ? WHERE discord_id = ?",
+    args: [freezeUntilIso, target.id],
+  });
+
+  const notifyMessage = `Your account has been froze by the administration of PTB for ${duration} ${duration === 1 ? "day" : "days"}, if you believe there has been any issues please contact us via tickets`;
+
+  let dmDelivered = false;
+  try {
+    if (target && typeof target.send === "function") {
+      await target.send(notifyMessage);
+      dmDelivered = true;
+    }
+  } catch (_dmError) {
+    // If the target user has closed DMs or blocked the bot, do not fail the freeze command
+    dmDelivered = false;
+  }
+
+  await interaction.reply({
+    content: `❄️ **${target.username}'s** account has been frozen for **${duration} ${duration === 1 ? "day" : "days"}** (until <t:${unixTimestamp}:f>). They cannot transfer funds or open transaction tickets during this time.${dmDelivered ? " The user has been notified via DM." : ""}`,
+    ...ephemeralReply,
+  });
+}
+
+export async function handleAccountUnfreeze(db, interaction) {
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+    await interaction.reply({ content: "Only server administrators can use this command.", ...ephemeralReply });
+    return;
+  }
+
+  const target = interaction.options.getUser("user", true);
+  const confirm = interaction.options.getBoolean("confirm", true);
+
+  if (!confirm) {
+    await interaction.reply({
+      content: "Unfreeze cancelled. You must set confirm to True to unfreeze an account.",
+      ...ephemeralReply,
+    });
+    return;
+  }
+
+  await ensureFrozenUntilColumn(db);
+
+  const accountResult = await db.execute({
+    sql: "SELECT discord_id, balance, frozen FROM accounts WHERE discord_id = ? LIMIT 1",
+    args: [target.id],
+  });
+
+  if (accountResult.rows.length === 0) {
+    await interaction.reply({
+      content: `${target.username} does not have a registered PTB account.`,
+      ...ephemeralReply,
+    });
+    return;
+  }
+
+  await db.execute({
+    sql: "UPDATE accounts SET frozen = 0, frozen_until = NULL WHERE discord_id = ?",
+    args: [target.id],
+  });
+
+  await interaction.reply({
+    content: `☀️ **${target.username}'s** account has been unfrozen. Their account access has been fully restored.`,
+    ...ephemeralReply,
+  });
+}
+

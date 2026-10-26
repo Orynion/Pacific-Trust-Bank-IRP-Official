@@ -455,7 +455,7 @@ function buildFallbackEmbed(raw, context) {
   return new EmbedBuilder()
     .setColor(analysis.findings.length || context.duplicateReference ? 0xD97706 : 0x0B3D2E)
     .setTitle(`Deposit receipt analysis · ${code}`)
-    .setDescription("Automated screenshot checks are advisory and do not prove a genuine in-game payment. A reviewer must inspect the receipt before approving this deposit.")
+    .setDescription("Automated screenshot checks are advisory. Information extracted from screenshot OCR is unverified it could be unreliable and we do not hide that. Nothing was changed in your balance")
     .addFields({ name: `Screenshot check for ${context.attachment.name ?? "receipt"}`.slice(0, 256), value: lines.join("\n").slice(0, 1024) })
     .setFooter({ text: "Receipt analysis only · no balance changes or automatic approvals" });
 }

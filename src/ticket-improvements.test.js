@@ -459,7 +459,7 @@ test("the real deposit-detection result shape renders through the shared deposit
     assert.match(fields.get("Transaction ID"), /TX-987654/);
     assert.match(fields.get("Receipt Status"), /completed/);
     assert.equal(fields.get("OCR Confidence"), "91.5%");
-    assert.match(fields.get("Verified Payment Status"), /Unverified/);
+    assert.match(fields.get("Verified Payment Status"), /Pending staff approval/);
 
     const check = await db.execute({
       sql: "SELECT ocr_text,extracted_payer,extracted_recipient,extracted_amount FROM treasury_ticket_receipt_checks WHERE ticket_id = ?",

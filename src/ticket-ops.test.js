@@ -186,7 +186,7 @@ test("tickets 2: double approval by two admins is idempotent and records the app
 
     const first = decide(db, { adminId: ADMIN_A, action: "approve", ticketId });
     await first.run;
-    assert.match(first.interaction.state.replies[0].content, /approved by the admin\. The ticket is now \*\*approved\*\*, funds have \*\*not\*\* moved yet\./);
+    assert.match(first.interaction.state.replies[0].content, /verified by an admin, although no changes to your balance were made/);
 
     const replay = decide(db, { adminId: ADMIN_B, action: "approve", ticketId });
     await replay.run;
@@ -224,7 +224,7 @@ test("tickets 3: simultaneous approvals produce exactly one approval", async () 
     const replies = clicks
       .filter((click, index) => outcomes[index].status === "fulfilled")
       .map((click) => click.interaction.state.replies?.[0]?.content ?? "");
-    const approvals = replies.filter((content) => /approved by the admin\. The ticket is now \*\*approved\*\*/.test(content));
+    const approvals = replies.filter((content) => /verified by an admin, although no changes to your balance were made/.test(content));
     assert.ok(approvals.length <= 1, "at most one approve click may win, got " + JSON.stringify(replies));
 
     // If every racing click hit fail-closed BUSY, settle one approval so the
@@ -262,7 +262,7 @@ test("tickets 4: a database failure during approval rolls back and a retry succe
 
     const retry = decide(db, { adminId: ADMIN_B, action: "approve", ticketId });
     await retry.run;
-    assert.match(retry.interaction.state.replies[0].content, /approved by the admin/);
+    assert.match(retry.interaction.state.replies[0].content, /verified by an admin/);
     assert.equal((await getTicket(db, ticketId)).status, "approved");
     assert.equal((await getTicket(db, ticketId)).decision_by, ADMIN_B);
   } finally {
@@ -635,7 +635,7 @@ test("tickets 14: rejecting a pending ticket is idempotent and moves no money", 
 
     const reject = decide(db, { adminId: ADMIN_A, action: "reject", ticketId });
     await reject.run;
-    assert.match(reject.interaction.state.replies[0].content, /rejected by the admin\. No balance changes were made\./);
+    assert.match(reject.interaction.state.replies[0].content, /rejected by admin\. Your balance was not updated\./);
 
     const replay = decide(db, { adminId: ADMIN_B, action: "reject", ticketId });
     await replay.run;

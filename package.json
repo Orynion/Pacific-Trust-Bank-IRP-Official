@@ -9,9 +9,9 @@
   },
   "scripts": {
     "dev": "node src/index.js",
-    "build": "node --check src/index.js && node --check src/interaction-responder.js && node --check src/bank-ops.js && node --check src/amount-checker.js && node --check src/ticket-config.js && node --check src/ticket-log.js && node --check src/ticket-ops.js && node --check src/ticket-deposit.js && node --check src/ptb-embeds.js && node --check src/transaction-history.js && node --check src/recurring-charges.js && node --check src/bloxlink-registration.js && node --check src/treasury-ops.js",
+    "build": "node --check src/index.js && node --check src/interaction-responder.js && node --check src/bank-ops.js && node --check src/amount-checker.js && node --check src/ticket-config.js && node --check src/ticket-log.js && node --check src/ticket-ops.js && node --check src/ticket-deposit.js && node --check src/deposit-detection.js && node --check src/ptb-embeds.js && node --check src/transaction-history.js && node --check src/recurring-charges.js && node --check src/bloxlink-registration.js && node --check src/treasury-ops.js",
     "start": "node src/index.js",
-    "test": "node --test src/bank-logic.test.js src/interaction-responder.test.js src/transaction-history.test.js src/ticket-ops.test.js src/ticket-improvements.test.js src/security-exploits.test.js src/bloxlink-registration.test.js src/amount-checker.test.js src/ptb-embeds.test.js src/treasury-ops.test.js src/turso-resilience.test.js"
+    "test": "node --test src/bank-logic.test.js src/interaction-responder.test.js src/transaction-history.test.js src/ticket-ops.test.js src/ticket-improvements.test.js src/security-exploits.test.js src/bloxlink-registration.test.js src/amount-checker.test.js src/ptb-embeds.test.js src/treasury-ops.test.js src/deposit-detection.test.js src/turso-resilience.test.js"
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",

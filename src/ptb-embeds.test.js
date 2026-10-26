@@ -36,7 +36,10 @@ test("PTB color palette and footers are consistent and frozen", () => {
   assert.equal(PTB_COLORS.MUTED, 0x475569);
 
   assert.match(PTB_FOOTERS.STANDARD, /Pacific Trust Bank/);
-  assert.match(PTB_FOOTERS.STANDARD, /Roleplay ledger only/);
+  assert.match(PTB_FOOTERS.STANDARD, /No real money is moved/);
+  assert.doesNotMatch(PTB_FOOTERS.STANDARD, /roleplay only/i);
+  assert.equal(PTB_FOOTERS.BALANCE, "Private ledger balance");
+  assert.doesNotMatch(PTB_FOOTERS.BALANCE, /roleplay only/i);
   assert.match(PTB_FOOTERS.ADVISORY_RECEIPT, /Receipt analysis only/);
 
   assert.throws(() => {
@@ -190,7 +193,7 @@ test("buildDepositAnalysisEmbed handles complete OCR result with all required fi
 
   assert.equal(embed.data.color, PTB_COLORS.DEPOSIT);
   assert.match(embed.data.title, /Deposit receipt analysis · PTB-D-25/);
-  assert.match(embed.data.description, /unverified and does not establish that a transaction occurred/);
+  assert.match(embed.data.description, /unverified it could be unreliable and we do not hide that/);
   assert.equal(embed.data.footer.text, PTB_FOOTERS.ADVISORY_RECEIPT);
 
   const fieldMap = Object.fromEntries(embed.data.fields.map((f) => [f.name, f.value]));
@@ -206,7 +209,7 @@ test("buildDepositAnalysisEmbed handles complete OCR result with all required fi
   assert.equal(fieldMap["OCR Confidence"], "94.8%");
 
   // Clearly distinguishes extracted OCR from verified status
-  assert.equal(fieldMap["Verified Payment Status"], "🟡 Unverified (pending staff approval)");
+  assert.equal(fieldMap["Verified Payment Status"], "🟡 Pending staff approval");
 
   // Context summary block verification
   assert.ok(embed.data.fields.some((f) => f.name.includes("Screenshot check for receipt.png")));
@@ -246,7 +249,7 @@ test("buildDepositAnalysisEmbed handles partial results and missing fields with 
   assert.equal(fieldMap["Receipt Status"], "Not detected");
   assert.equal(fieldMap["Payment Method"], "Not detected");
   assert.equal(fieldMap["OCR Confidence"], "Not detected");
-  assert.equal(fieldMap["Verified Payment Status"], "🟡 Unverified (pending staff approval)");
+  assert.equal(fieldMap["Verified Payment Status"], "🟡 Pending staff approval");
 });
 
 test("buildDepositAnalysisEmbed handles OCR processing failures and error results gracefully", () => {

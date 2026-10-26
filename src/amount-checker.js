@@ -216,6 +216,6 @@ export function buildAmountCheckerMessage({ comparison, claimedAmount, extracted
     );
   }
   lines.push(`Status: ${statusWording(status, comparisonCode)}`);
-  if (reference) lines.push(`Receipt ${reference} — Screenshot analysis is advisory; a treasury reviewer must confirm this payment.`);
+  if (reference) lines.push(`Receipt ${reference} — The bot could be unreliable and may make mistakes, recheck in case of serious matters.`);
   return lines.join("\n");
 }

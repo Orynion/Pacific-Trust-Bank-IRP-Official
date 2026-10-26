@@ -18,8 +18,11 @@ import { acknowledgeWithinDeadline, isExpiredInteractionError, respond } from ".
 import { getTransactionHistory, handleHistoryButton } from "./transaction-history.js";
 import { handleBillCommand, processDueCharges, recurringChargeSchemaStatements, runRecurringChargesSweep, sendDueChargeReminders } from "./recurring-charges.js";
 import {
+  ensureFrozenUntilColumn,
   ephemeralReply,
   handleAddBalance,
+  handleAccountFreeze,
+  handleAccountUnfreeze,
   handleBalance,
   handleMoneyRequest,
   handleTransfer,
@@ -44,16 +47,118 @@ let discordReady = false;
 const healthServer = createServer((request, response) => {
   try {
     const requestUrl = new URL(request.url ?? "/", "http://localhost");
-    if (requestUrl.pathname === "/health" || requestUrl.pathname === "/") {
-      response.writeHead(discordReady ? 200 : 503, { "content-type": "text/plain; charset=utf-8" });
-      response.end(discordReady ? "ok" : "starting");
+    if (requestUrl.pathname === "/health") {
+      response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({
+        status: "ok",
+        service: "ptb-discord-bot",
+        discordReady,
+        database: dbUrl.startsWith("file:") ? "local-sqlite" : "turso",
+        uptime: process.uptime()
+      }));
+      return;
+    }
+
+    if (requestUrl.pathname === "/") {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pacific Trust Bank - Discord Bot Status</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #38bdf8;
+      --success: #10b981;
+      --warning: #f59e0b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      max-width: 600px;
+      width: 100%;
+      padding: 2rem;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+    .badge-ok { background: rgba(16, 185, 129, 0.2); color: var(--success); }
+    .badge-warn { background: rgba(245, 158, 11, 0.2); color: var(--warning); }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    h1 { font-size: 1.5rem; margin-top: 1rem; margin-bottom: 0.5rem; }
+    p { color: var(--text-muted); font-size: 0.95rem; line-height: 1.5; margin-bottom: 1rem; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1.5rem; margin-bottom: 1.5rem; }
+    .stat { background: rgba(0, 0, 0, 0.2); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); }
+    .stat-label { font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.05em; }
+    .stat-val { font-size: 1.1rem; font-weight: 600; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <span class="badge ${discordReady ? 'badge-ok' : 'badge-warn'}">
+      <span class="status-dot"></span>
+      ${discordReady ? 'Bot Connected & Operational' : 'Dev Server Running (Standby)'}
+    </span>
+    <h1>Pacific Trust Bank Bot</h1>
+    <p>The backend server is active and responding on port ${port}.</p>
+    <div class="grid">
+      <div class="stat">
+        <div class="stat-label">Discord Gateway</div>
+        <div class="stat-val">${discordReady ? 'Online' : 'Awaiting Token'}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Database</div>
+        <div class="stat-val">${dbUrl.startsWith('file:') ? 'SQLite Local' : 'Turso Remote'}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Receipt OCR</div>
+        <div class="stat-val" style="color: var(--accent);">Tesseract + Sharp Active</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">HTTP Health</div>
+        <div class="stat-val" style="color: var(--success);">HTTP 200 OK</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>`);
       return;
     }
 
     response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
     response.end("not found");
   } catch (error) {
-    // A request-handler throw must never take the health server (or the bot) down.
     console.error("PTB health server request failed:", error);
     if (!response.headersSent) {
       response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
@@ -161,6 +266,38 @@ const addBalanceCommand = new SlashCommandBuilder()
     .setMinValue(1)
     .setRequired(true));
 
+const accountFreezeCommand = new SlashCommandBuilder()
+  .setName("account-freeze")
+  .setDescription("Freeze a registered PTB account (Administrators only).")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .addUserOption((option) => option
+    .setName("user")
+    .setDescription("The user whose account will be frozen.")
+    .setRequired(true))
+  .addIntegerOption((option) => option
+    .setName("duration")
+    .setDescription("Duration of the freeze in days (1 to 7).")
+    .setMinValue(1)
+    .setMaxValue(7)
+    .setRequired(true))
+  .addBooleanOption((option) => option
+    .setName("confirm")
+    .setDescription("Confirm that you want to freeze this account.")
+    .setRequired(true));
+
+const accountUnfreezeCommand = new SlashCommandBuilder()
+  .setName("account-unfreeze")
+  .setDescription("Unfreeze a registered PTB account (Administrators only).")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .addUserOption((option) => option
+    .setName("user")
+    .setDescription("The user whose account will be unfrozen.")
+    .setRequired(true))
+  .addBooleanOption((option) => option
+    .setName("confirm")
+    .setDescription("Confirm that you want to unfreeze this account.")
+    .setRequired(true));
+
 const transferCommand = new SlashCommandBuilder()
   .setName("transfer")
   .setDescription("Transfer money from your PTB account to another user.")
@@ -211,7 +348,7 @@ function createHelpEmbed(isAdministrator) {
   const embed = new EmbedBuilder()
     .setColor(0x0B3D2E)
     .setTitle("🏦 Pacific Trust Bank | Command Guide")
-    .setDescription("PTB is a roleplay ledger for Emergency Hamburg RP. Commands below are limited to what your account can use.")
+    .setDescription("PTB is a bank ledger for Emergency Hamburg RP. Commands below are limited to what your account can use.")
     .addFields(
       {
         name: "General",
@@ -253,7 +390,7 @@ function createHelpEmbed(isAdministrator) {
     });
   }
 
-  return embed.setFooter({ text: "Pacific Trust Bank • Roleplay ledger only; no real money is moved." });
+  return embed.setFooter({ text: "Pacific Trust Bank • No real money is moved." });
 }
 
 async function handleHelp(interaction) {
@@ -536,6 +673,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 async function runChatCommand(interaction) {
   if (!["ping", "help", "register", "unregister"].includes(interaction.commandName) &&
       interaction.commandName !== "add-user" &&
+      interaction.commandName !== "account-freeze" &&
+      interaction.commandName !== "account-unfreeze" &&
+      interaction.commandName !== "add-balance" &&
       !["treasury-search", "treasury-report", "treasury-total"].includes(interaction.commandName)) {
     const accountResult = await db.execute({
       sql: "SELECT 1 FROM accounts WHERE discord_id = ? AND roblox_id IS NOT NULL LIMIT 1",
@@ -570,6 +710,10 @@ async function runChatCommand(interaction) {
     await handleAddUser(db, interaction, ticketConfig().staffRoleIds);
   } else if (interaction.commandName === "add-balance") {
     await handleAddBalance(db, interaction);
+  } else if (interaction.commandName === "account-freeze") {
+    await handleAccountFreeze(db, interaction);
+  } else if (interaction.commandName === "account-unfreeze") {
+    await handleAccountUnfreeze(db, interaction);
   } else if (interaction.commandName === "transfer") {
     await handleTransfer(db, interaction);
   } else if (interaction.commandName === "bill" || interaction.commandName === "tax") {
@@ -605,6 +749,7 @@ async function initializeDatabase() {
     // Adds amount_comparison to treasury tables created before the automatic
     // amount checker; fresh tables already include it and this call is idempotent.
     await ensureAmountComparisonColumn(db);
+    await ensureFrozenUntilColumn(db);
     console.log("PTB ledger database initialized successfully.");
     return true;
   } catch (error) {
@@ -653,6 +798,8 @@ async function startDiscord() {
             withdrawCommand.toJSON(),
             addUserCommand.toJSON(),
             addBalanceCommand.toJSON(),
+            accountFreezeCommand.toJSON(),
+            accountUnfreezeCommand.toJSON(),
             transferCommand.toJSON(),
             billCommand.toJSON(),
             taxCommand.toJSON(),

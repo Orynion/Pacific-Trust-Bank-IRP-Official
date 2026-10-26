@@ -7,9 +7,12 @@ import { createClient } from "@libsql/client";
 import { MessageFlags, PermissionFlagsBits } from "discord.js";
 import {
   handleAddBalance,
+  handleAccountFreeze,
+  handleAccountUnfreeze,
   handleBalance,
   handleMoneyRequest,
   handleTransfer,
+  isAccountFrozen,
   schemaStatements,
   validateMoneyAmount,
 } from "./bank-ops.js";
@@ -58,6 +61,7 @@ function createInteraction({
   targetUser = null,
   amount = null,
   confirm = null,
+  duration = null,
   permissions = null,
   inGuild = true,
 } = {}) {
@@ -71,6 +75,10 @@ function createInteraction({
         if (name === "amount") {
           if (amount === null && required) throw new Error(`missing required option ${name}`);
           return amount;
+        }
+        if (name === "duration") {
+          if (duration === null && required) throw new Error(`missing required option ${name}`);
+          return duration;
         }
         return null;
       },
@@ -951,6 +959,123 @@ test("case 10: ledger entries account for every balance delta across mixed opera
       assert.ok(debitSide.debited >= row.amount);
       assert.ok(creditSide.credited >= row.amount);
     }
+  } finally {
+    await db.close();
+    await removeDirBestEffort(dir);
+  }
+});
+
+test("case 10: /account-freeze and /account-unfreeze enforce administrator permissions, duration limits, and correctly toggle frozen state", async () => {
+  const { db, dir } = openTestDb();
+  const adminId = "280000000000000001";
+  const targetId = "280000000000000002";
+  const sentDms = [];
+  const targetUser = {
+    id: targetId,
+    username: "Bob",
+    bot: false,
+    async send(msg) {
+      sentDms.push(msg);
+      return { id: "dm-1" };
+    },
+  };
+
+  try {
+    await db.batch(schemaStatements, "write");
+    await seedAccount(db, targetId, { balance: 500 });
+
+    // Non-admin denial
+    const nonAdminInteraction = createInteraction({
+      userId: targetId,
+      targetUser,
+      duration: 3,
+      confirm: true,
+      permissions: [],
+    });
+    await handleAccountFreeze(db, nonAdminInteraction);
+    assert.match(nonAdminInteraction.state.replies[0].content, /Only server administrators can use this command/);
+
+    // Cancelled when confirm is false
+    const cancelInteraction = createInteraction({
+      userId: adminId,
+      targetUser,
+      duration: 3,
+      confirm: false,
+      permissions: [ADMIN_FLAG],
+    });
+    await handleAccountFreeze(db, cancelInteraction);
+    assert.match(cancelInteraction.state.replies[0].content, /Freeze cancelled/);
+
+    // Duration out of bounds (e.g. 8 days)
+    const invalidDurationInteraction = createInteraction({
+      userId: adminId,
+      targetUser,
+      duration: 8,
+      confirm: true,
+      permissions: [ADMIN_FLAG],
+    });
+    await handleAccountFreeze(db, invalidDurationInteraction);
+    assert.match(invalidDurationInteraction.state.replies[0].content, /Duration must be between 1 and 7 days/);
+
+    // Successful freeze for 5 days with DM notification
+    const freezeInteraction = createInteraction({
+      userId: adminId,
+      targetUser,
+      duration: 5,
+      confirm: true,
+      permissions: [ADMIN_FLAG],
+    });
+    await handleAccountFreeze(db, freezeInteraction);
+    assert.match(freezeInteraction.state.replies[0].content, /account has been frozen for \*\*5 days\*\*/);
+    assert.equal(sentDms.length, 1);
+    assert.equal(
+      sentDms[0],
+      "Your account has been froze by the administration of PTB for 5 days, if you believe there has been any issues please contact us via tickets",
+    );
+
+    // Ensure freeze still succeeds if DM fails (e.g. user has DMs closed)
+    const closedDmUser = {
+      id: targetId,
+      username: "Bob",
+      bot: false,
+      async send() {
+        throw new Error("Cannot send messages to this user");
+      },
+    };
+    const freezeWithClosedDms = createInteraction({
+      userId: adminId,
+      targetUser: closedDmUser,
+      duration: 2,
+      confirm: true,
+      permissions: [ADMIN_FLAG],
+    });
+    await handleAccountFreeze(db, freezeWithClosedDms);
+    assert.match(freezeWithClosedDms.state.replies[0].content, /account has been frozen for \*\*2 days\*\*/);
+
+    // Verify account is frozen in database
+    const checkRow = (await db.execute({ sql: "SELECT frozen, frozen_until FROM accounts WHERE discord_id = ?", args: [targetId] })).rows[0];
+    assert.equal(Number(checkRow.frozen), 1);
+    assert.ok(checkRow.frozen_until);
+    assert.ok(isAccountFrozen(checkRow));
+
+    // Verify isAccountFrozen returns false once expiry has passed
+    const pastDate = new Date(Date.now() + 6 * 24 * 60 * 60 * 1000);
+    assert.equal(isAccountFrozen(checkRow, pastDate), false);
+
+    // Admin manually unfreezes
+    const unfreezeInteraction = createInteraction({
+      userId: adminId,
+      targetUser,
+      confirm: true,
+      permissions: [ADMIN_FLAG],
+    });
+    await handleAccountUnfreeze(db, unfreezeInteraction);
+    assert.match(unfreezeInteraction.state.replies[0].content, /account has been unfrozen/);
+
+    const unfrozenRow = (await db.execute({ sql: "SELECT frozen, frozen_until FROM accounts WHERE discord_id = ?", args: [targetId] })).rows[0];
+    assert.equal(Number(unfrozenRow.frozen), 0);
+    assert.equal(unfrozenRow.frozen_until, null);
+    assert.equal(isAccountFrozen(unfrozenRow), false);
   } finally {
     await db.close();
     await removeDirBestEffort(dir);

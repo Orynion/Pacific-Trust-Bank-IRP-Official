@@ -177,22 +177,37 @@ function runTesseract(bytes, command, pageSegmentationMode) {
 }
 
 async function defaultRunOcr(bytes) {
-  // Tesseract is optional and local. Its output is a review hint only; absence
-  // or failure must never reject a receipt. TESSERACT_PATH can point at a
-  // non-default binary location (for example a Windows install or a Bothost
-  // container path).
-  const command = process.env.TESSERACT_PATH || "tesseract";
-  const passes = await Promise.all([6, 11].map(async (pageSegmentationMode) => {
+  // If TESSERACT_PATH is explicitly set (e.g. system binary), try it first.
+  if (process.env.TESSERACT_PATH) {
     try {
-      return await runTesseract(bytes, command, pageSegmentationMode);
-    } catch (error) {
-      return { error };
+      const command = process.env.TESSERACT_PATH;
+      const passes = await Promise.all([6, 11].map(async (pageSegmentationMode) => {
+        try {
+          return await runTesseract(bytes, command, pageSegmentationMode);
+        } catch (error) {
+          return { error };
+        }
+      }));
+      const results = passes.filter((pass) => typeof pass === "string" && pass);
+      if (results.length) {
+        return [...new Set(results.flatMap((text) => text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)))].join("\n");
+      }
+    } catch {
+      // Fall back to JavaScript Tesseract.js engine
     }
-  }));
-  const results = passes.filter((pass) => typeof pass === "string" && pass);
-  const failures = passes.filter((pass) => pass?.error);
-  if (!results.length && failures.length) throw failures[0].error;
-  return [...new Set(results.flatMap((text) => text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)))].join("\n");
+  }
+
+  // Code-based local Tesseract.js and Sharp engine fallback
+  try {
+    const { analyzeReceipt: runJsOcr } = await import("./deposit-detection.js");
+    const result = await runJsOcr(bytes);
+    if (result?.ocr?.text) {
+      return result.ocr.text;
+    }
+  } catch (error) {
+    console.warn("PTB local Tesseract.js OCR engine failed:", error?.message ?? String(error));
+  }
+  return "";
 }
 
 // Test-only OCR engine override so the submission flow can be tested without
