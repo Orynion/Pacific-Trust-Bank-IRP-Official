@@ -188,7 +188,7 @@ export function describeAmountComparison(code) {
 function statusWording(status, comparison) {
   switch (status) {
     case "PENDING": return "Pending manual verification.";
-    case "NEEDS_REVIEW": return comparison === AMOUNT_NEEDS_REVIEW ? "Needs review." : "Flagged for review.";
+    case "NEEDS_REVIEW": return comparison === AMOUNT_NEEDS_REVIEW ? "Needs review." : null;
     case "DUPLICATE": return "Recorded as a duplicate for review.";
     default: return `${status}.`;
   }
@@ -215,7 +215,8 @@ export function buildAmountCheckerMessage({ comparison, claimedAmount, extracted
       `Result: The amounts ${comparisonCode === AMOUNT_MATCH ? "match." : "do not match."}`,
     );
   }
-  lines.push(`Status: ${statusWording(status, comparisonCode)}`);
-  if (reference) lines.push(`Receipt ${reference} — The bot could be unreliable and may make mistakes, recheck in case of serious matters.`);
+  const statusText = statusWording(status, comparisonCode);
+  if (statusText) lines.push(`Status: ${statusText}`);
+  lines.push("The bot could be unreliable and may make mistakes, recheck in case of serious matters.");
   return lines.join("\n");
 }

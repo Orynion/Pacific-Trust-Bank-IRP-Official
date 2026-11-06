@@ -33,6 +33,12 @@ import { handleAddUser, handleTicketCloseModal, handleTicketCloseRequest, handle
 import { ticketConfig, validateTicketConfiguration } from "./ticket-config.js";
 import { handleDepositTicketImage, ticketDepositSchemaStatements } from "./ticket-deposit.js";
 import { ensureAmountComparisonColumn, handleTreasuryButton, handleTreasuryModal, submitTreasuryPayment, treasurySchemaStatements } from "./treasury-ops.js";
+import {
+  handleServerEmbedCommand,
+  handleServerEmbedDropdownSelect,
+  handleServerEmbedModalSubmit,
+  serverEmbedCommand,
+} from "./ptb-embeds.js";
 
 const requiredEnv = ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID", "TURSO_URL", "TURSO_AUTH_TOKEN"];
 const missingEnv = requiredEnv.filter((name) => !process.env[name]);
@@ -389,7 +395,10 @@ function createHelpEmbed(isAdministrator) {
   if (isAdministrator) {
     embed.addFields({
       name: "Administration",
-      value: "`/add-balance user amount` — Add funds to a registered user's ledger account.\nExample: `/add-balance user:@Alex amount:500`",
+      value: [
+        "`/add-balance user amount` — Add funds to a registered user's ledger account.\nExample: `/add-balance user:@Alex amount:500`",
+        "`/server-embed title [description] [color] [image_url] [footer]` — Post a custom rich embed in this channel.",
+      ].join("\n\n"),
     });
   }
 
@@ -596,6 +605,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     return;
   }
+  if (interaction.isModalSubmit() && interaction.customId.startsWith("server-embed-dropdown-modal:")) {
+    try {
+      await handleServerEmbedModalSubmit(interaction);
+    } catch (error) {
+      console.error("PTB server embed dropdown modal failed:", error);
+      await respond(interaction, { content: "I could not post that embed with dropdown.", ...ephemeralReply })
+        .catch((replyError) => console.error("Could not send embed modal error reply:", replyError));
+    }
+    return;
+  }
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith("server-embed-dropdown")) {
+    try {
+      await handleServerEmbedDropdownSelect(interaction);
+    } catch (error) {
+      console.error("PTB server embed dropdown select failed:", error);
+      await respond(interaction, { content: "I could not process that selection.", ...ephemeralReply })
+        .catch((replyError) => console.error("Could not send dropdown select error reply:", replyError));
+    }
+    return;
+  }
   if (interaction.isButton()) {
     const treasuryMatch = interaction.customId.match(/^trv-(approve|approve-confirm|reject|info|flag):(IRPT-\d+)$/);
     if (treasuryMatch) {
@@ -682,7 +711,8 @@ async function runChatCommand(interaction) {
       interaction.commandName !== "account-unfreeze" &&
       interaction.commandName !== "add-balance" &&
       interaction.commandName !== "treasury" &&
-      interaction.commandName !== "treasury-submit") {
+      interaction.commandName !== "treasury-submit" &&
+      interaction.commandName !== "server-embed") {
     let accountResult = await db.execute({
       sql: "SELECT 1 FROM accounts WHERE discord_id = ? LIMIT 1",
       args: [interaction.user.id],
@@ -736,6 +766,8 @@ async function runChatCommand(interaction) {
     interaction.commandName === "treasury-submit"
   ) {
     await submitTreasuryPayment(db, interaction, { reviewChannelId: process.env.TREASURY_REVIEW_CHANNEL_ID, reviewerRoleIds: TREASURY_REVIEW_ROLES });
+  } else if (interaction.commandName === "server-embed") {
+    await handleServerEmbedCommand(interaction);
   }
 }
 
@@ -807,6 +839,7 @@ async function startDiscord() {
             taxCommand.toJSON(),
             treasuryCommand.toJSON(),
             treasurySubmitCommand.toJSON(),
+            serverEmbedCommand.toJSON(),
           ],
         },
       );

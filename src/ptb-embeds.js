@@ -1,8 +1,14 @@
 import {
+  ActionRowBuilder,
   EmbedBuilder,
   MessageFlags,
+  ModalBuilder,
   PermissionFlagsBits,
   SlashCommandBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from "discord.js";
 
 /**
@@ -379,6 +385,54 @@ export function buildTicketWelcomeEmbed({
 }
 
 /**
+ * Formats a cardinal number as an ordinal string (e.g. 1 -> 1st, 2 -> 2nd).
+ * @param {number} n
+ * @returns {string}
+ */
+export function formatOrdinal(n) {
+  const num = Math.max(1, Math.floor(Number(n) || 1));
+  const j = num % 10;
+  const k = num % 100;
+  if (j === 1 && k !== 11) return `${num}st`;
+  if (j === 2 && k !== 12) return `${num}nd`;
+  if (j === 3 && k !== 13) return `${num}rd`;
+  return `${num}th`;
+}
+
+/**
+ * Formats a descriptive label for uploaded screenshots (e.g. "1st image by alice").
+ * @param {object} options
+ * @param {string} [options.username]
+ * @param {number} [options.index]
+ * @returns {string}
+ */
+export function formatImageLabel({ username, index = 1 } = {}) {
+  const ordinal = formatOrdinal(index);
+  const user = username && String(username).trim() ? String(username).trim() : "user";
+  return `${ordinal} image by ${user}`;
+}
+
+/**
+ * Resolves a human-friendly image label from ticket/embed context.
+ * Falls back to "1st image by <username>" rather than displaying raw file names.
+ * @param {object} context
+ * @returns {string}
+ */
+export function resolveImageLabel(context = {}) {
+  if (context.imageLabel && typeof context.imageLabel === "string" && context.imageLabel.trim()) {
+    return context.imageLabel.trim();
+  }
+  const index = Number(context.imageIndex) || 1;
+  const username = context.username
+    || context.message?.author?.username
+    || context.authorUsername
+    || context.claimedPayer
+    || context.ticket?.requester_username
+    || "user";
+  return formatImageLabel({ username, index });
+}
+
+/**
  * Reusable builder for deposit receipt analysis embeds.
  * Accepts structured OCR results from the deposit reader and formats a clear,
  * branded presentation strictly distinguishing extracted OCR data from verified status.
@@ -408,9 +462,8 @@ export function buildDepositAnalysisEmbed(result, context = {}) {
       { name: "Verification Status", value: "🟡 Unverified (human review required)", inline: true },
       { name: "OCR Result", value: "❌ Processing failed", inline: true },
     ];
-    if (context.attachment?.name) {
-      fields.push({ name: "Uploaded File", value: truncate(context.attachment.name, DISCORD_LIMITS.FIELD_VALUE), inline: true });
-    }
+    const imageLabel = resolveImageLabel(context);
+    fields.push({ name: "Uploaded Image", value: truncate(imageLabel, DISCORD_LIMITS.FIELD_VALUE), inline: true });
 
     return buildPtbEmbed({
       color: PTB_COLORS.ERROR,
@@ -481,11 +534,23 @@ export function buildDepositAnalysisEmbed(result, context = {}) {
     }
   }
 
-  // Format date and time
-  let dateTimeDisplay = notDetected;
-  if (date && time) dateTimeDisplay = `${date} ${time}`;
-  else if (date) dateTimeDisplay = date;
-  else if (time) dateTimeDisplay = time;
+  // Format timestamp for Discord <t:timestamp:f>
+  let unixTimestamp = null;
+  if (date) {
+    const dateStr = time ? `${date} ${time}` : date;
+    const parsed = Date.parse(dateStr);
+    if (!Number.isNaN(parsed)) {
+      unixTimestamp = Math.floor(parsed / 1000);
+    }
+  }
+  if (!unixTimestamp) {
+    const rawTs = context.timestamp ?? context.message?.createdTimestamp ?? Date.now();
+    const parsedTs = typeof rawTs === "number" ? rawTs : Date.parse(rawTs);
+    if (!Number.isNaN(parsedTs)) {
+      unixTimestamp = Math.floor(parsedTs / 1000);
+    }
+  }
+  const timeDisplay = unixTimestamp ? `<t:${unixTimestamp}:f>` : notDetected;
 
   // Format confidence
   const confidenceDisplay = (Number.isFinite(confidence) && confidence > 0)
@@ -504,54 +569,27 @@ export function buildDepositAnalysisEmbed(result, context = {}) {
   const code = context.ticket ? safeTicketCode(context.ticket) : (context.ticketCode || null);
   const title = code ? `Deposit receipt analysis · ${code}` : "Deposit receipt analysis";
 
-  const embedFields = [];
+  // Ticket opener's connected Roblox account takes priority for Sender
+  const senderDisplay = claimedPayer
+    || context.ticket?.requester_roblox_username
+    || context.ticket?.roblox_username
+    || result.claimedPayer
+    || sender
+    || notDetected;
 
-  // When attached to a ticket message, provide the detailed screenshot evaluation block
-  if (context.attachment || context.ticket) {
-    const attachmentName = context.attachment?.name || "receipt";
-    const duplicateLine = duplicateRef
-      ? `Duplicate: exact match to ${duplicateRef}`
-      : "Duplicate: no exact screenshot match found";
-
-    const amountLine = extractedAmount === null
-      ? "Sent amount: not readable"
-      : `Amount: ${extractedAmount}${comparison === "MATCH" ? " (matches ticket amount)" : comparison === "MISMATCH" && claimedAmount ? ` (ticket claims ${Number(claimedAmount).toLocaleString()})` : ""}`;
-
-    const summaryLines = [
-      `Payment screen: ${paymentScreenDetected ? "detected from OCR cues" : "not confidently identified"}`,
-      `Sender / payer (${claimedPayer || "account has no linked Roblox name"}): ${sender ? "matched from explicit sender text" : "not confirmed by OCR"}`,
-      `Recipient: ${recipient ?? "not confirmed by OCR"}`,
-      amountLine,
-      `Amount comparison: ${comparison === "MATCH" ? "MATCH — matches the ticket amount" : comparison === "MISMATCH" ? "MISMATCH — does not match the ticket amount" : "NEEDS_REVIEW — amount not confidently identified"}`,
-      duplicateLine,
-      `Transaction ID: ${transactionId ?? "not found"}`,
-      `Findings: ${findingsList.length ? findingsList.join(", ") : "No OCR discrepancy detected"}`,
-    ];
-
-    embedFields.push({
-      name: `Screenshot check for ${attachmentName}`,
-      value: summaryLines.join("\n"),
-      inline: false,
-    });
-  }
-
-  // Structured OCR data fields with consistent "Not detected" fallbacks
-  embedFields.push(
-    { name: "Amount & Currency", value: amountDisplay, inline: true },
-    { name: "Recipient", value: recipient || notDetected, inline: true },
-    { name: "Sender / Payer", value: sender || notDetected, inline: true },
-    { name: "Transaction ID", value: transactionId ? `\`${transactionId}\`` : notDetected, inline: true },
-    { name: "Date & Time", value: dateTimeDisplay, inline: true },
-    { name: "Receipt Status", value: paymentStatus ? `${paymentStatus} (read from screenshot)` : notDetected, inline: true },
-    { name: "Payment Method", value: paymentMethod || notDetected, inline: true },
-    { name: "OCR Confidence", value: confidenceDisplay, inline: true },
-    { name: "Verified Payment Status", value: "🟡 Pending staff approval", inline: true },
-  );
+  // Direct fields only: Amount, Recipient, Sender, Time, Confidence
+  const embedFields = [
+    { name: "Amount", value: truncate(amountDisplay, DISCORD_LIMITS.FIELD_VALUE), inline: true },
+    { name: "Recipient", value: truncate(recipient || notDetected, DISCORD_LIMITS.FIELD_VALUE), inline: true },
+    { name: "Sender", value: truncate(senderDisplay, DISCORD_LIMITS.FIELD_VALUE), inline: true },
+    { name: "Time", value: truncate(timeDisplay, DISCORD_LIMITS.FIELD_VALUE), inline: true },
+    { name: "Confidence", value: truncate(confidenceDisplay, DISCORD_LIMITS.FIELD_VALUE), inline: true },
+  ];
 
   return buildPtbEmbed({
     color: embedColor,
     title,
-    description: "Automated screenshot checks are advisory. Information extracted from screenshot OCR is unverified it could be unreliable and we do not hide that. Nothing was changed in your balance",
+    description: "The automated checks are advisory and still in beta testing.",
     fields: embedFields,
     footer: PTB_FOOTERS.ADVISORY_RECEIPT,
   });
@@ -875,110 +913,590 @@ export function buildCustomEmbed(options, strict = false) {
  * Creates the slash command specification for `/server-embed`.
  * Requires Discord Administrator permissions by default.
  * @returns {SlashCommandBuilder}
+/**
+ * Converts hex color strings (#5865F2, 0x5865F2, 5865F2) into numeric integers.
+ * Defaults to Discord Blurple (0x5865F2) if empty.
+ * @param {string|number|null|undefined} value
+ * @returns {number}
  */
-export function createServerEmbedCommand() {
-  return new SlashCommandBuilder()
-    .setName("server-embed")
-    .setDescription("Create a customized announcement or information embed (Administrators only).")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption((opt) => opt
-      .setName("title")
+export function parseEmbedColor(value) {
+  if (!value) return 0x5865F2;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.floor(value);
+  }
+
+  const raw = String(value).trim();
+  const normalized = raw.replace(/^#/, "").replace(/^0x/i, "");
+  if (!/^[\da-f]{6}$/i.test(normalized)) {
+    // If it's a known named theme color, resolve it gracefully
+    const named = resolveColor(raw, null);
+    if (named !== null && named !== PTB_COLORS.PRIMARY) return named;
+    throw new Error("Color must be a six-digit hex value, such as #5865F2.");
+  }
+
+  return parseInt(normalized, 16);
+}
+
+/**
+ * Validates that the provided image URL has a valid syntax and uses http/https.
+ * @param {string|null|undefined} value
+ * @returns {string|null}
+ */
+export function validateImageUrl(value) {
+  if (!value) return null;
+
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Image URL must be a valid http:// or https:// URL.");
+  }
+
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("Image URL must begin with http:// or https://.");
+  }
+
+  return url.toString();
+}
+
+/**
+ * Truncates and sanitizes embed fields to fit within Discord boundaries.
+ * Discord Limits:
+ * - Title: 256 chars
+ * - Description: 4096 chars
+ * - Field Name: 256 chars
+ * - Field Value: 1024 chars
+ * - Max Fields: 25 fields
+ * @param {object} embed
+ * @returns {object}
+ */
+export function sanitizeEmbed(embed) {
+  if (!embed) return embed;
+  if (embed.title && embed.title.length > 256) {
+    embed.title = embed.title.slice(0, 253) + "...";
+  }
+  if (embed.description && embed.description.length > 4096) {
+    embed.description = embed.description.slice(0, 4093) + "...";
+  }
+  if (Array.isArray(embed.fields)) {
+    const safeFields = [];
+    for (const f of embed.fields) {
+      if (safeFields.length >= 25) break;
+      const name = (f.name || "Field").slice(0, 256);
+      const val = String(f.value || "None");
+      if (val.length <= 1024) {
+        safeFields.push({ name, value: val, inline: Boolean(f.inline) });
+      } else {
+        let remaining = val;
+        let part = 1;
+        while (remaining.length > 0 && safeFields.length < 25) {
+          const chunk = remaining.slice(0, 1000);
+          remaining = remaining.slice(1000);
+          safeFields.push({
+            name: part === 1 ? name : `${name} (Cont. ${part})`.slice(0, 256),
+            value: chunk,
+            inline: false,
+          });
+          part++;
+        }
+      }
+    }
+    embed.fields = safeFields.slice(0, 25);
+  }
+  return embed;
+}
+
+/**
+ * Splits lists of lines across multiple fields so no individual field exceeds 1024 characters.
+ * @param {Array<object>} fields Target array to push chunked fields into
+ * @param {string} baseName Base field name
+ * @param {Array<string>} lines Lines to format into chunks
+ * @param {string} [separator="\n\n"] Chunk separator
+ * @param {number} [maxChunkLength=1000] Maximum length before splitting
+ */
+export function addSafeChunkedFields(fields, baseName, lines, separator = "\n\n", maxChunkLength = 1000) {
+  if (!lines || lines.length === 0) return;
+  let currentChunk = "";
+  let part = 1;
+
+  for (const rawLine of lines) {
+    const line = String(rawLine).slice(0, maxChunkLength);
+    const toAdd = currentChunk ? `${currentChunk}${separator}${line}` : line;
+
+    if (toAdd.length > maxChunkLength) {
+      if (currentChunk) {
+        fields.push({
+          name: part === 1 ? baseName : `${baseName} (Part ${part})`.slice(0, 256),
+          value: currentChunk.slice(0, 1024),
+          inline: false,
+        });
+        part++;
+        currentChunk = line;
+      } else {
+        fields.push({
+          name: part === 1 ? baseName : `${baseName} (Part ${part})`.slice(0, 256),
+          value: line.slice(0, 1024),
+          inline: false,
+        });
+        part++;
+        currentChunk = "";
+      }
+    } else {
+      currentChunk = toAdd;
+    }
+
+    if (fields.length >= 24) break;
+  }
+
+  if (currentChunk && fields.length < 25) {
+    fields.push({
+      name: part === 1 ? baseName : `${baseName} (Part ${part})`.slice(0, 256),
+      value: currentChunk.slice(0, 1024),
+      inline: false,
+    });
+  }
+}
+
+/**
+ * Parses user input for dropdown select menu options.
+ * Accepts newline-separated, pipe-separated ("Label | Description"),
+ * or comma-separated items.
+ *
+ * @param {string} rawInput
+ * @returns {Array<{ label: string, value: string, description?: string }>}
+ */
+export function parseDropdownOptions(rawInput) {
+  if (!rawInput || typeof rawInput !== "string") return [];
+
+  const lines = rawInput.includes("\n")
+    ? rawInput.split("\n")
+    : rawInput.split(/[,;]/);
+
+  const options = [];
+  let index = 1;
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    if (options.length >= 25) break; // Discord maximum options per select menu
+
+    let label = trimmed;
+    let description = null;
+
+    if (trimmed.includes("|")) {
+      const parts = trimmed.split("|").map((p) => p.trim());
+      label = parts[0] || `Option ${index}`;
+      description = parts[1] || null;
+    } else if (trimmed.includes(" - ")) {
+      const parts = trimmed.split(" - ").map((p) => p.trim());
+      label = parts[0] || `Option ${index}`;
+      description = parts[1] || null;
+    } else if (trimmed.includes(": ") && !trimmed.startsWith("http")) {
+      const parts = trimmed.split(": ").map((p) => p.trim());
+      label = parts[0] || `Option ${index}`;
+      description = parts[1] || null;
+    }
+
+    label = label.slice(0, 100);
+    if (description) description = description.slice(0, 100);
+    const sanitizedVal = label.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 80);
+    const value = `opt_${index}_${sanitizedVal || "item"}`.slice(0, 100);
+
+    options.push({
+      label,
+      value,
+      description: description || undefined,
+    });
+    index++;
+  }
+
+  return options;
+}
+
+/**
+ * Builds a Discord ActionRow containing a StringSelectMenuBuilder.
+ *
+ * @param {object} [params]
+ * @param {string} [params.customId="server-embed-dropdown"]
+ * @param {string} [params.placeholder="Select an option..."]
+ * @param {Array<{ label: string, value: string, description?: string, emoji?: string }>} [params.options=[]]
+ * @returns {ActionRowBuilder|null}
+ */
+export function buildDropdownComponent({
+  customId = "server-embed-dropdown",
+  placeholder = "Select an option...",
+  options = [],
+} = {}) {
+  if (!Array.isArray(options) || options.length === 0) return null;
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(customId)
+    .setPlaceholder((placeholder || "Select an option...").slice(0, 150))
+    .setMinValues(1)
+    .setMaxValues(1);
+
+  for (const opt of options.slice(0, 25)) {
+    const optionBuilder = new StringSelectMenuOptionBuilder()
+      .setLabel(String(opt.label || "Option").slice(0, 100))
+      .setValue(String(opt.value || `opt_${Math.random()}`).slice(0, 100));
+
+    if (opt.description) {
+      optionBuilder.setDescription(String(opt.description).slice(0, 100));
+    }
+    if (opt.emoji) {
+      optionBuilder.setEmoji(opt.emoji);
+    }
+    select.addOptions(optionBuilder);
+  }
+
+  return new ActionRowBuilder().addComponents(select);
+}
+
+/**
+ * Storage for pending dropdown modal configuration sessions.
+ */
+export const pendingEmbedModalConfigs = new Map();
+
+/**
+ * Slash command definition for /server-embed with dropdown support.
+ */
+export const serverEmbedCommand = new SlashCommandBuilder()
+  .setName("server-embed")
+  .setDescription("Admin: Post a custom rich embed in this channel")
+  .addStringOption((o) =>
+    o.setName("title")
       .setDescription("Embed title")
       .setRequired(true)
-      .setMaxLength(DISCORD_LIMITS.TITLE))
-    .addStringOption((opt) => opt
-      .setName("description")
-      .setDescription("Embed description / body text")
-      .setRequired(true)
-      .setMaxLength(DISCORD_LIMITS.DESCRIPTION))
-    .addStringOption((opt) => opt
-      .setName("color")
-      .setDescription("Embed color hex (e.g. #0B3D2E, #16A34A, primary, success, warning, error)")
+      .setMaxLength(256))
+  .addStringOption((o) =>
+    o.setName("description")
+      .setDescription("Embed description")
+      .setRequired(false)
+      .setMaxLength(4096))
+  .addStringOption((o) =>
+    o.setName("color")
+      .setDescription("Hex color, for example #5865F2")
+      .setRequired(false)
       .setMaxLength(30))
-    .addChannelOption((opt) => opt
-      .setName("channel")
+  .addStringOption((o) =>
+    o.setName("image_url")
+      .setDescription("Image URL beginning with http:// or https://")
+      .setRequired(false)
+      .setMaxLength(2048))
+  .addStringOption((o) =>
+    o.setName("footer")
+      .setDescription("Footer text")
+      .setRequired(false)
+      .setMaxLength(2048))
+  .addStringOption((o) =>
+    o.setName("function")
+      .setDescription("Embed functionality (select 'dropdown' to attach a select menu)")
+      .setRequired(false)
+      .addChoices(
+        { name: "dropdown", value: "dropdown" },
+      ))
+  .addStringOption((o) =>
+    o.setName("dropdown_placeholder")
+      .setDescription("Placeholder text for the dropdown (e.g. Choose an option...)")
+      .setRequired(false)
+      .setMaxLength(150))
+  .addStringOption((o) =>
+    o.setName("dropdown_options")
+      .setDescription("Dropdown options (e.g. Option 1 | Details, Option 2 | Details)")
+      .setRequired(false)
+      .setMaxLength(2000))
+  .addChannelOption((o) =>
+    o.setName("channel")
       .setDescription("Target channel to post in (defaults to current channel)"))
-    .addStringOption((opt) => opt
-      .setName("thumbnail")
+  .addStringOption((o) =>
+    o.setName("thumbnail")
       .setDescription("Thumbnail image URL (http/https)")
+      .setRequired(false)
       .setMaxLength(500))
-    .addStringOption((opt) => opt
-      .setName("image")
+  .addStringOption((o) =>
+    o.setName("image")
       .setDescription("Large banner image URL (http/https)")
-      .setMaxLength(500))
-    .addStringOption((opt) => opt
-      .setName("footer")
-      .setDescription("Custom footer text")
-      .setMaxLength(DISCORD_LIMITS.FOOTER));
+      .setRequired(false)
+      .setMaxLength(2048))
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
+
+/**
+ * Creates the slash command specification for `/server-embed`.
+ * Requires Discord Administrator permissions by default.
+ * @returns {SlashCommandBuilder}
+ */
+export function createServerEmbedCommand() {
+  return serverEmbedCommand;
 }
 
 /**
  * Handles `/server-embed` command execution.
- * Enforces administrator permissions, validates all inputs, and delivers the embed.
+ * Enforces administrator permissions, validates all inputs, and delivers the embed
+ * with optional dropdown select menu (via modal setup or direct parameters).
  *
  * @param {import("discord.js").ChatInputCommandInteraction} interaction
  * @returns {Promise<void>}
  */
 export async function handleServerEmbedCommand(interaction) {
-  const ephemeral = { flags: MessageFlags.Ephemeral };
+  // 1. Double-check administrator permissions server-side
+  const hasAdmin = Boolean(
+    interaction.member?.permissions?.has(PermissionFlagsBits.Administrator) ||
+    interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+  );
 
-  if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
-    await interaction.reply({
+  if (!hasAdmin) {
+    const errorPayload = {
       content: "Only server administrators can use the `/server-embed` command.",
-      ...ephemeral,
-    });
+      flags: MessageFlags.Ephemeral,
+    };
+    if (typeof interaction.reply === "function") {
+      await interaction.reply(errorPayload);
+    }
     return;
   }
 
-  const title = interaction.options.getString("title", true);
-  const description = interaction.options.getString("description", true);
-  const color = interaction.options.getString("color");
-  const targetChannel = interaction.options.getChannel("channel") || interaction.channel;
-  const thumbnail = interaction.options.getString("thumbnail");
-  const image = interaction.options.getString("image");
-  const footer = interaction.options.getString("footer");
+  const title = interaction.options.getString("title");
+  const description = interaction.options.getString("description");
+  const colorInput = interaction.options.getString("color");
+  const imageUrlInput = interaction.options.getString("image_url") || interaction.options.getString("image");
+  const thumbnailInput = interaction.options.getString?.("thumbnail");
+  const footerText = interaction.options.getString("footer");
+  const functionChoice = interaction.options.getString?.("function");
+  const dropdownPlaceholder = interaction.options.getString?.("dropdown_placeholder");
+  const dropdownOptionsRaw = interaction.options.getString?.("dropdown_options");
+  const targetChannel = interaction.options.getChannel?.("channel");
 
-  const embedOptions = {
-    title,
-    description,
-    color,
-    thumbnail,
-    image,
-    footer,
-  };
-
-  const validation = validateCustomEmbedOptions(embedOptions);
-  if (!validation.valid) {
-    await interaction.reply({
-      content: `Invalid embed configuration:\n• ${validation.errors.join("\n• ")}`,
-      ...ephemeral,
-    });
-    return;
-  }
-
-  const embed = buildCustomEmbed(embedOptions);
-
-  try {
-    if (!targetChannel || typeof targetChannel.send !== "function") {
-      await interaction.reply({
-        content: "The target channel could not be reached or does not support sending messages.",
-        ...ephemeral,
-      });
-      return;
+  // If function:dropdown selected without options provided, open modal so admin can fill out options
+  const wantsDropdownModal = (functionChoice === "dropdown" && !dropdownOptionsRaw);
+  if (wantsDropdownModal && typeof interaction.showModal === "function" && !interaction.deferred && !interaction.replied) {
+    try {
+      if (colorInput) parseEmbedColor(colorInput);
+      if (imageUrlInput) validateImageUrl(imageUrlInput);
+      if (thumbnailInput) validateImageUrl(thumbnailInput);
+    } catch (err) {
+      return interaction.reply({ content: `⚠️ ${err.message}`, flags: MessageFlags.Ephemeral });
     }
 
-    await targetChannel.send({ embeds: [embed] });
-    await interaction.reply({
-      content: `Embed successfully posted in <#${targetChannel.id}>.`,
-      ...ephemeral,
+    const token = Math.random().toString(36).slice(2, 10);
+    pendingEmbedModalConfigs.set(token, {
+      embedData: { title, description, color: colorInput, imageUrl: imageUrlInput, thumbnailUrl: thumbnailInput, footerText },
+      targetChannelId: targetChannel?.id || interaction.channelId,
+      createdAt: Date.now(),
+      adminId: interaction.user?.id,
     });
-  } catch (error) {
-    console.error("[PTB Embed] Failed to send custom server embed:", error);
-    await interaction.reply({
-      content: `Failed to deliver embed: ${error?.message || "Unknown Discord API error"}`,
-      ...ephemeral,
-    });
+
+    const modal = new ModalBuilder()
+      .setCustomId(`server-embed-dropdown-modal:${token}`)
+      .setTitle("Configure Dropdown Menu");
+
+    const placeholderInput = new TextInputBuilder()
+      .setCustomId("placeholder")
+      .setLabel("Dropdown Placeholder")
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder(dropdownPlaceholder || "Select an option...")
+      .setValue(dropdownPlaceholder || "Select an option...")
+      .setRequired(false)
+      .setMaxLength(150);
+
+    const optionsInput = new TextInputBuilder()
+      .setCustomId("options")
+      .setLabel("Dropdown Options (one per line: Label | Desc)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setPlaceholder("Option 1 | Details about option 1\nOption 2 | Details about option 2\nOption 3")
+      .setRequired(true)
+      .setMaxLength(2000);
+
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(placeholderInput),
+      new ActionRowBuilder().addComponents(optionsInput),
+    );
+
+    await interaction.showModal(modal);
+    return;
   }
+
+  // Defer reply if available and not already acknowledged
+  if (typeof interaction.deferReply === "function" && !interaction.deferred && !interaction.replied) {
+    await interaction.deferReply().catch(() => {});
+  }
+
+  // 2. Parse and validate inputs with user-friendly error messages
+  let color;
+  let imageUrl = null;
+  let thumbnailUrl = null;
+  try {
+    color = parseEmbedColor(colorInput);
+    imageUrl = validateImageUrl(imageUrlInput);
+    if (thumbnailInput) thumbnailUrl = validateImageUrl(thumbnailInput);
+  } catch (err) {
+    const errorMsg = `⚠️ ${err.message}`;
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ content: errorMsg });
+    }
+    return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
+  }
+
+  // 3. Assemble the embed object
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setColor(color);
+
+  if (description) embed.setDescription(description);
+  if (imageUrl) embed.setImage(imageUrl);
+  if (thumbnailUrl) embed.setThumbnail(thumbnailUrl);
+  if (footerText) embed.setFooter({ text: footerText });
+
+  // 4. Build dropdown component if options are provided or function is dropdown
+  let components = [];
+  if (dropdownOptionsRaw) {
+    const parsedOptions = parseDropdownOptions(dropdownOptionsRaw);
+    if (parsedOptions.length > 0) {
+      const row = buildDropdownComponent({
+        placeholder: dropdownPlaceholder || "Select an option...",
+        options: parsedOptions,
+      });
+      if (row) components.push(row);
+    }
+  }
+
+  // 5. Send the embed
+  if (targetChannel && typeof targetChannel.send === "function" && targetChannel.id !== interaction.channel?.id) {
+    try {
+      await targetChannel.send({ embeds: [embed], components });
+      const confirmation = `Embed successfully posted in <#${targetChannel.id}>.`;
+      if (interaction.deferred || interaction.replied) {
+        return interaction.editReply({ content: confirmation });
+      }
+      return interaction.reply({ content: confirmation, flags: MessageFlags.Ephemeral });
+    } catch (sendError) {
+      const failMsg = `Failed to deliver embed: ${sendError?.message || "Unknown Discord API error"}`;
+      if (interaction.deferred || interaction.replied) {
+        return interaction.editReply({ content: failMsg });
+      }
+      return interaction.reply({ content: failMsg, flags: MessageFlags.Ephemeral });
+    }
+  }
+
+  if (interaction.channel && typeof interaction.channel.send === "function" && !interaction.deferred && !interaction.replied) {
+    try {
+      await interaction.channel.send({ embeds: [embed], components });
+      return interaction.reply({
+        content: `Embed successfully posted in <#${interaction.channel.id}>.`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch {
+      // Fall through to editReply / reply
+    }
+  }
+
+  if (interaction.deferred || interaction.replied) {
+    return interaction.editReply({ embeds: [embed], components });
+  }
+  return interaction.reply({ embeds: [embed], components });
+}
+
+/**
+ * Handles modal submissions for the server-embed dropdown configuration.
+ *
+ * @param {import("discord.js").ModalSubmitInteraction} interaction
+ * @returns {Promise<void>}
+ */
+export async function handleServerEmbedModalSubmit(interaction) {
+  const token = interaction.customId.replace("server-embed-dropdown-modal:", "");
+  const pending = pendingEmbedModalConfigs.get(token);
+
+  if (!pending) {
+    const errorMsg = "⚠️ This embed configuration session has expired or was not found. Please run `/server-embed` again.";
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ content: errorMsg });
+    }
+    return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
+  }
+
+  if (typeof interaction.deferReply === "function" && !interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+
+  const placeholder = interaction.fields?.getTextInputValue?.("placeholder") || "Select an option...";
+  const optionsRaw = interaction.fields?.getTextInputValue?.("options") || "";
+  const parsedOptions = parseDropdownOptions(optionsRaw);
+
+  if (parsedOptions.length === 0) {
+    const errorMsg = "⚠️ Please provide at least one valid dropdown option (e.g. `Option 1 | Description`).";
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ content: errorMsg });
+    }
+    return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
+  }
+
+  const { title, description, color, imageUrl, thumbnailUrl, footerText } = pending.embedData;
+  const parsedColor = parseEmbedColor(color);
+  const embed = new EmbedBuilder().setTitle(title).setColor(parsedColor);
+  if (description) embed.setDescription(description);
+  if (imageUrl) embed.setImage(imageUrl);
+  if (thumbnailUrl) embed.setThumbnail(thumbnailUrl);
+  if (footerText) embed.setFooter({ text: footerText });
+
+  const row = buildDropdownComponent({
+    placeholder,
+    options: parsedOptions,
+  });
+  const components = row ? [row] : [];
+
+  let targetChannel = null;
+  if (interaction.client?.channels && pending.targetChannelId) {
+    try {
+      targetChannel = await interaction.client.channels.fetch(pending.targetChannelId);
+    } catch {
+      targetChannel = interaction.channel;
+    }
+  } else {
+    targetChannel = interaction.channel;
+  }
+
+  try {
+    if (targetChannel && typeof targetChannel.send === "function") {
+      await targetChannel.send({ embeds: [embed], components });
+      pendingEmbedModalConfigs.delete(token);
+      const confirmation = `Embed with dropdown successfully posted in <#${targetChannel.id}>.`;
+      if (interaction.deferred || interaction.replied) {
+        return interaction.editReply({ content: confirmation });
+      }
+      return interaction.reply({ content: confirmation, flags: MessageFlags.Ephemeral });
+    } else {
+      pendingEmbedModalConfigs.delete(token);
+      if (interaction.deferred || interaction.replied) {
+        return interaction.editReply({ embeds: [embed], components });
+      }
+      return interaction.reply({ embeds: [embed], components });
+    }
+  } catch (error) {
+    console.error("[PTB Embed] Failed to send embed with dropdown:", error);
+    const errorMsg = `Failed to deliver embed: ${error?.message || "Unknown error"}`;
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ content: errorMsg });
+    }
+    return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
+  }
+}
+
+/**
+ * Handles interactions when a user selects an item from a server-embed dropdown.
+ *
+ * @param {import("discord.js").StringSelectMenuInteraction} interaction
+ * @returns {Promise<void>}
+ */
+export async function handleServerEmbedDropdownSelect(interaction) {
+  const selectedValue = interaction.values?.[0];
+  const selectedOption = interaction.component?.options?.find((opt) => opt.value === selectedValue);
+  const label = selectedOption?.label || selectedValue || "Unknown option";
+  const desc = selectedOption?.description ? `\n> ${selectedOption.description}` : "";
+
+  const responseContent = `You selected **${label}**${desc}`;
+  if (interaction.deferred || interaction.replied) {
+    return interaction.editReply({ content: responseContent });
+  }
+  return interaction.reply({ content: responseContent, flags: MessageFlags.Ephemeral });
 }
 
 export default {
@@ -996,6 +1514,9 @@ export default {
   buildErrorEmbed,
   buildTicketPanelEmbed,
   buildTicketWelcomeEmbed,
+  formatOrdinal,
+  formatImageLabel,
+  resolveImageLabel,
   buildDepositAnalysisEmbed,
   buildDepositReceiptEmbed,
   buildReceiptAnalysisEmbed,
@@ -1005,7 +1526,17 @@ export default {
   buildTicketClosureEmbed,
   validateCustomEmbedOptions,
   buildCustomEmbed,
+  parseEmbedColor,
+  validateImageUrl,
+  sanitizeEmbed,
+  addSafeChunkedFields,
+  parseDropdownOptions,
+  buildDropdownComponent,
+  pendingEmbedModalConfigs,
+  serverEmbedCommand,
   createServerEmbedCommand,
   handleServerEmbedCommand,
+  handleServerEmbedModalSubmit,
+  handleServerEmbedDropdownSelect,
 };
 

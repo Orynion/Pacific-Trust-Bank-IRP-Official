@@ -19,10 +19,23 @@ import {
   buildDepositAnalysisEmbed,
   buildStaffNotificationEmbed,
   buildTicketClosureSummaryEmbed,
+  formatOrdinal,
+  formatImageLabel,
+  resolveImageLabel,
   validateCustomEmbedOptions,
   buildCustomEmbed,
   createServerEmbedCommand,
   handleServerEmbedCommand,
+  parseEmbedColor,
+  validateImageUrl,
+  sanitizeEmbed,
+  addSafeChunkedFields,
+  parseDropdownOptions,
+  buildDropdownComponent,
+  pendingEmbedModalConfigs,
+  serverEmbedCommand,
+  handleServerEmbedModalSubmit,
+  handleServerEmbedDropdownSelect,
 } from "./ptb-embeds.js";
 
 test("PTB color palette and footers are consistent and frozen", () => {
@@ -193,26 +206,24 @@ test("buildDepositAnalysisEmbed handles complete OCR result with all required fi
 
   assert.equal(embed.data.color, PTB_COLORS.DEPOSIT);
   assert.match(embed.data.title, /Deposit receipt analysis · PTB-D-25/);
-  assert.match(embed.data.description, /unverified it could be unreliable and we do not hide that/);
+  assert.equal(embed.data.description, "The automated checks are advisory and still in beta testing.");
   assert.equal(embed.data.footer.text, PTB_FOOTERS.ADVISORY_RECEIPT);
 
   const fieldMap = Object.fromEntries(embed.data.fields.map((f) => [f.name, f.value]));
 
-  // Verify all 8 prompt-requested pieces of information
-  assert.match(fieldMap["Amount & Currency"], /500 EUR \(matches ticket amount\)/);
+  // Verify direct fields only: Amount, Recipient, Sender, Time, Confidence
+  assert.equal(embed.data.fields.length, 5);
+  assert.match(fieldMap["Amount"], /500 EUR \(matches ticket amount\)/);
   assert.equal(fieldMap["Recipient"], "IRP Treasury");
-  assert.match(fieldMap["Sender / Payer"], /Alice_1/);
-  assert.equal(fieldMap["Transaction ID"], "`TX-998811`");
-  assert.equal(fieldMap["Date & Time"], "2026-10-24 14:30");
-  assert.match(fieldMap["Receipt Status"], /completed \(read from screenshot\)/);
-  assert.equal(fieldMap["Payment Method"], "Bank Transfer");
-  assert.equal(fieldMap["OCR Confidence"], "94.8%");
+  assert.equal(fieldMap["Sender"], "Alice_1");
+  assert.match(fieldMap["Time"], /^<t:\d+:f>$/);
+  assert.equal(fieldMap["Confidence"], "94.8%");
 
-  // Clearly distinguishes extracted OCR from verified status
-  assert.equal(fieldMap["Verified Payment Status"], "🟡 Pending staff approval");
-
-  // Context summary block verification
-  assert.ok(embed.data.fields.some((f) => f.name.includes("Screenshot check for receipt.png")));
+  // Verify excluded fields
+  assert.equal(fieldMap["Transaction ID"], undefined);
+  assert.equal(fieldMap["Receipt Status"], undefined);
+  assert.equal(fieldMap["Payment Method"], undefined);
+  assert.equal(fieldMap["Verified Payment Status"], undefined);
 });
 
 test("buildDepositAnalysisEmbed handles partial results and missing fields with 'Not detected'", () => {
@@ -241,15 +252,14 @@ test("buildDepositAnalysisEmbed handles partial results and missing fields with 
 
   const fieldMap = Object.fromEntries(embed.data.fields.map((f) => [f.name, f.value]));
 
-  assert.equal(fieldMap["Amount & Currency"], "1,000");
+  assert.equal(embed.data.fields.length, 5);
+  assert.equal(fieldMap["Amount"], "1,000");
   assert.equal(fieldMap["Recipient"], "Not detected");
-  assert.equal(fieldMap["Sender / Payer"], "Not detected");
-  assert.equal(fieldMap["Transaction ID"], "Not detected");
-  assert.equal(fieldMap["Date & Time"], "Not detected");
-  assert.equal(fieldMap["Receipt Status"], "Not detected");
-  assert.equal(fieldMap["Payment Method"], "Not detected");
-  assert.equal(fieldMap["OCR Confidence"], "Not detected");
-  assert.equal(fieldMap["Verified Payment Status"], "🟡 Pending staff approval");
+  assert.equal(fieldMap["Sender"], "Not detected");
+  assert.match(fieldMap["Time"], /^<t:\d+:f>$/);
+  assert.equal(fieldMap["Confidence"], "Not detected");
+  assert.equal(fieldMap["Transaction ID"], undefined);
+  assert.equal(fieldMap["Receipt Status"], undefined);
 });
 
 test("buildDepositAnalysisEmbed handles OCR processing failures and error results gracefully", () => {
@@ -270,7 +280,7 @@ test("buildDepositAnalysisEmbed handles OCR processing failures and error result
 
   const fieldMap = Object.fromEntries(embed.data.fields.map((f) => [f.name, f.value]));
   assert.match(fieldMap["Verification Status"], /human review required/);
-  assert.match(fieldMap["Uploaded File"], /blurry.jpg/);
+  assert.match(fieldMap["Uploaded Image"], /1st image by user/);
 });
 
 test("buildDepositAnalysisEmbed respects Discord embed limits on oversized inputs", () => {
@@ -473,4 +483,435 @@ test("handleServerEmbedCommand enforces administrator permission and sends embed
   assert.equal(sent.embeds[0].data.title, "Announcements");
   assert.equal(sent.embeds[0].data.color, 0x0B3D2E);
 });
+
+test("formatOrdinal correctly handles 1st, 2nd, 3rd, 4th, 11th, 12th, 13th, 21st, 22nd, 23rd", () => {
+  assert.equal(formatOrdinal(1), "1st");
+  assert.equal(formatOrdinal(2), "2nd");
+  assert.equal(formatOrdinal(3), "3rd");
+  assert.equal(formatOrdinal(4), "4th");
+  assert.equal(formatOrdinal(11), "11th");
+  assert.equal(formatOrdinal(12), "12th");
+  assert.equal(formatOrdinal(13), "13th");
+  assert.equal(formatOrdinal(21), "21st");
+  assert.equal(formatOrdinal(22), "22nd");
+  assert.equal(formatOrdinal(23), "23rd");
+  assert.equal(formatOrdinal(24), "24th");
+});
+
+test("formatImageLabel and resolveImageLabel construct user-centric image descriptions", () => {
+  assert.equal(formatImageLabel({ username: "alice", index: 1 }), "1st image by alice");
+  assert.equal(formatImageLabel({ username: "bob", index: 2 }), "2nd image by bob");
+  assert.equal(formatImageLabel({ username: "charlie", index: 3 }), "3rd image by charlie");
+  assert.equal(formatImageLabel({ username: "", index: 1 }), "1st image by user");
+
+  assert.equal(resolveImageLabel({ imageLabel: "custom label" }), "custom label");
+  assert.equal(resolveImageLabel({ username: "alice", imageIndex: 1 }), "1st image by alice");
+  assert.equal(resolveImageLabel({ message: { author: { username: "dave" } }, imageIndex: 2 }), "2nd image by dave");
+  assert.equal(resolveImageLabel({ claimedPayer: "Eve_1", imageIndex: 3 }), "3rd image by Eve_1");
+});
+
+test("buildDepositAnalysisEmbed error and success embeds display user image labels instead of file names", () => {
+  // Error embed replaces raw file name with image label
+  const errorResult = { status: "error", error: { message: "Corrupted image" } };
+  const errorEmbed = buildDepositAnalysisEmbed(errorResult, {
+    username: "alice",
+    imageIndex: 2,
+    attachment: { name: "secret_file_123.png" },
+  });
+  const errorField = errorEmbed.data.fields.find((f) => f.name === "Uploaded Image");
+  assert.ok(errorField);
+  assert.equal(errorField.value, "2nd image by alice");
+  assert.ok(!JSON.stringify(errorEmbed.data).includes("secret_file_123.png"));
+
+  // Success embed keeps direct fields and does not leak raw file name
+  const successResult = {
+    status: "ok",
+    fields: { amount: 100, recipient: "IRP Treasury", sender: "alice" },
+    ocr: { text: "100 EUR to IRP Treasury", confidence: 95 },
+  };
+  const successEmbed = buildDepositAnalysisEmbed(successResult, {
+    username: "alice",
+    imageIndex: 1,
+    attachment: { name: "raw_receipt_999.png" },
+    claimedAmount: 100,
+  });
+  assert.equal(successEmbed.data.fields.length, 5);
+  assert.ok(!JSON.stringify(successEmbed.data).includes("raw_receipt_999.png"));
+});
+
+test("parseEmbedColor converts hex strings and defaults to Blurple 0x5865F2", () => {
+  assert.equal(parseEmbedColor(""), 0x5865F2);
+  assert.equal(parseEmbedColor(null), 0x5865F2);
+  assert.equal(parseEmbedColor(undefined), 0x5865F2);
+  assert.equal(parseEmbedColor("#5865F2"), 0x5865F2);
+  assert.equal(parseEmbedColor("0x5865F2"), 0x5865F2);
+  assert.equal(parseEmbedColor("5865F2"), 0x5865F2);
+  assert.equal(parseEmbedColor("#0B3D2E"), 0x0B3D2E);
+
+  assert.throws(() => parseEmbedColor("xyz123"), /six-digit hex value/);
+  assert.throws(() => parseEmbedColor("#123"), /six-digit hex value/);
+  assert.throws(() => parseEmbedColor("not-a-color"), /six-digit hex value/);
+});
+
+test("validateImageUrl validates syntax and enforces http/https protocol", () => {
+  assert.equal(validateImageUrl(null), null);
+  assert.equal(validateImageUrl(""), null);
+  assert.equal(validateImageUrl("https://cdn.example.com/logo.png"), "https://cdn.example.com/logo.png");
+  assert.equal(validateImageUrl("http://example.com/banner.jpg"), "http://example.com/banner.jpg");
+
+  assert.throws(() => validateImageUrl("not-a-valid-url"), /valid http:\/\/ or https:\/\/ URL/);
+  assert.throws(() => validateImageUrl("ftp://example.com/file.png"), /begin with http:\/\/ or https:\/\//);
+  assert.throws(() => validateImageUrl("javascript:alert(1)"), /begin with http:\/\/ or https:\/\//);
+});
+
+test("sanitizeEmbed safely truncates title, description, and chunks long field values", () => {
+  const overlong = {
+    title: "T".repeat(300),
+    description: "D".repeat(4500),
+    fields: [
+      { name: "LongField", value: "A".repeat(2500) },
+    ],
+  };
+
+  const sanitized = sanitizeEmbed(overlong);
+  assert.ok(sanitized.title.length <= 256);
+  assert.ok(sanitized.title.endsWith("..."));
+  assert.ok(sanitized.description.length <= 4096);
+  assert.ok(sanitized.description.endsWith("..."));
+
+  // Check field chunking
+  assert.ok(sanitized.fields.length >= 3);
+  assert.equal(sanitized.fields[0].name, "LongField");
+  assert.match(sanitized.fields[1].name, /LongField \(Cont\. 2\)/);
+  for (const f of sanitized.fields) {
+    assert.ok(f.value.length <= 1024);
+  }
+});
+
+test("addSafeChunkedFields breaks long line lists across multiple fields safely", () => {
+  const fields = [];
+  const lines = Array.from({ length: 30 }, (_, i) => `Line ${i + 1}: ${"X".repeat(80)}`);
+
+  addSafeChunkedFields(fields, "Transaction List", lines);
+
+  assert.ok(fields.length > 1);
+  assert.ok(fields.length <= 25);
+  assert.equal(fields[0].name, "Transaction List");
+  assert.match(fields[1].name, /Transaction List \(Part 2\)/);
+  for (const f of fields) {
+    assert.ok(f.value.length <= 1024);
+  }
+});
+
+test("serverEmbedCommand and handleServerEmbedCommand support image_url, color validation, and admin execution", async () => {
+  const json = serverEmbedCommand.toJSON();
+  assert.equal(json.name, "server-embed");
+  assert.equal(json.default_member_permissions, String(PermissionFlagsBits.Administrator));
+
+  const optionNames = json.options.map((o) => o.name);
+  assert.ok(optionNames.includes("title"));
+  assert.ok(optionNames.includes("description"));
+  assert.ok(optionNames.includes("color"));
+  assert.ok(optionNames.includes("image_url"));
+  assert.ok(optionNames.includes("footer"));
+
+  let editReplyPayload = null;
+  let replyPayload = null;
+  const adminInteraction = {
+    member: {
+      permissions: {
+        has: (perm) => perm === PermissionFlagsBits.Administrator,
+      },
+    },
+    memberPermissions: {
+      has: (perm) => perm === PermissionFlagsBits.Administrator,
+    },
+    deferred: true,
+    replied: false,
+    options: {
+      getString: (name) => {
+        if (name === "title") return "Server Announcement";
+        if (name === "description") return "Welcome to PTB.";
+        if (name === "color") return "#5865F2";
+        if (name === "image_url") return "https://example.com/banner.png";
+        if (name === "footer") return "PTB Staff Team";
+        return null;
+      },
+      getChannel: () => null,
+    },
+    editReply: async (payload) => { editReplyPayload = payload; },
+    reply: async (payload) => { replyPayload = payload; },
+  };
+
+  await handleServerEmbedCommand(adminInteraction);
+  assert.ok(editReplyPayload?.embeds?.length === 1);
+  const data = editReplyPayload.embeds[0].data;
+  assert.equal(data.title, "Server Announcement");
+  assert.equal(data.description, "Welcome to PTB.");
+  assert.equal(data.color, 0x5865F2);
+  assert.equal(data.image.url, "https://example.com/banner.png");
+  assert.equal(data.footer.text, "PTB Staff Team");
+
+  // Error case: invalid color
+  let errorReply = null;
+  const badColorInteraction = {
+    member: { permissions: { has: () => true } },
+    deferred: true,
+    options: {
+      getString: (name) => {
+        if (name === "title") return "Test";
+        if (name === "color") return "invalid-hex";
+        return null;
+      },
+      getChannel: () => null,
+    },
+    editReply: async (payload) => { errorReply = payload; },
+  };
+
+  await handleServerEmbedCommand(badColorInteraction);
+  assert.match(errorReply.content, /⚠️ Color must be a six-digit hex value/);
+});
+
+test("parseDropdownOptions parses newline, pipe, and comma formats while enforcing Discord boundaries", () => {
+  assert.deepEqual(parseDropdownOptions(null), []);
+  assert.deepEqual(parseDropdownOptions(""), []);
+  assert.deepEqual(parseDropdownOptions("   "), []);
+
+  // Pipe format with descriptions
+  const pipeInput = "Deposit Guide | How to submit deposit receipts\nWithdrawal Rules | Terms and limits\nGeneral FAQs";
+  const pipeParsed = parseDropdownOptions(pipeInput);
+  assert.equal(pipeParsed.length, 3);
+  assert.equal(pipeParsed[0].label, "Deposit Guide");
+  assert.equal(pipeParsed[0].description, "How to submit deposit receipts");
+  assert.equal(pipeParsed[0].value, "opt_1_deposit_guide");
+  assert.equal(pipeParsed[1].label, "Withdrawal Rules");
+  assert.equal(pipeParsed[1].description, "Terms and limits");
+  assert.equal(pipeParsed[1].value, "opt_2_withdrawal_rules");
+  assert.equal(pipeParsed[2].label, "General FAQs");
+  assert.equal(pipeParsed[2].description, undefined);
+  assert.equal(pipeParsed[2].value, "opt_3_general_faqs");
+
+  // Comma format fallback
+  const commaInput = "Option A, Option B, Option C";
+  const commaParsed = parseDropdownOptions(commaInput);
+  assert.equal(commaParsed.length, 3);
+  assert.equal(commaParsed[0].label, "Option A");
+  assert.equal(commaParsed[1].label, "Option B");
+  assert.equal(commaParsed[2].label, "Option C");
+
+  // Truncation limits: Discord allows max 100 chars for label and description, and max 25 options
+  const overlongLabel = "L".repeat(150);
+  const overlongDesc = "D".repeat(150);
+  const truncatedParsed = parseDropdownOptions(`${overlongLabel} | ${overlongDesc}`);
+  assert.equal(truncatedParsed[0].label.length, 100);
+  assert.equal(truncatedParsed[0].description.length, 100);
+
+  // Max 25 options
+  const manyOptions = Array.from({ length: 30 }, (_, i) => `Option ${i + 1}`).join("\n");
+  const cappedParsed = parseDropdownOptions(manyOptions);
+  assert.equal(cappedParsed.length, 25);
+});
+
+test("buildDropdownComponent constructs ActionRow with StringSelectMenuBuilder", () => {
+  assert.equal(buildDropdownComponent({ options: [] }), null);
+
+  const options = [
+    { label: "Option 1", value: "opt1", description: "First choice" },
+    { label: "Option 2", value: "opt2" },
+  ];
+  const row = buildDropdownComponent({
+    customId: "custom-menu-id",
+    placeholder: "Choose wisely...",
+    options,
+  });
+
+  assert.ok(row);
+  const rowJson = row.toJSON();
+  assert.equal(rowJson.type, 1); // ActionRow
+  assert.equal(rowJson.components.length, 1);
+  const menu = rowJson.components[0];
+  assert.equal(menu.type, 3); // StringSelect
+  assert.equal(menu.custom_id, "custom-menu-id");
+  assert.equal(menu.placeholder, "Choose wisely...");
+  assert.equal(menu.options.length, 2);
+  assert.equal(menu.options[0].label, "Option 1");
+  assert.equal(menu.options[0].value, "opt1");
+  assert.equal(menu.options[0].description, "First choice");
+});
+
+test("handleServerEmbedCommand displays modal when function:dropdown is selected without inline options", async () => {
+  let modalShown = null;
+  const interaction = {
+    member: {
+      permissions: {
+        has: () => true,
+      },
+    },
+    memberPermissions: {
+      has: () => true,
+      ADMINISTRATOR: PermissionFlagsBits.Administrator,
+    },
+    user: { id: "admin-user-123" },
+    channelId: "channel-999",
+    deferred: false,
+    replied: false,
+    options: {
+      getString: (name) => {
+        if (name === "title") return "Server Rules & Roles";
+        if (name === "description") return "Select your department below.";
+        if (name === "function") return "dropdown";
+        if (name === "dropdown_placeholder") return "Choose your department...";
+        return null;
+      },
+      getChannel: () => null,
+    },
+    showModal: async (modal) => {
+      modalShown = modal;
+    },
+    reply: async () => {},
+  };
+
+  await handleServerEmbedCommand(interaction);
+
+  assert.ok(modalShown, "Modal should have been presented to administrator");
+  const modalData = modalShown.toJSON();
+  assert.equal(modalData.title, "Configure Dropdown Menu");
+  assert.match(modalData.custom_id, /^server-embed-dropdown-modal:[a-z0-9]+$/);
+
+  const token = modalData.custom_id.replace("server-embed-dropdown-modal:", "");
+  assert.ok(pendingEmbedModalConfigs.has(token), "Pending embed configuration stored");
+  const pending = pendingEmbedModalConfigs.get(token);
+  assert.equal(pending.embedData.title, "Server Rules & Roles");
+  assert.equal(pending.adminId, "admin-user-123");
+});
+
+test("handleServerEmbedCommand creates embed and dropdown directly when dropdown_options are provided", async () => {
+  let replyPayload = null;
+  const interaction = {
+    member: {
+      permissions: {
+        has: () => true,
+      },
+    },
+    memberPermissions: {
+      has: () => true,
+    },
+    deferred: true,
+    replied: false,
+    options: {
+      getString: (name) => {
+        if (name === "title") return "Quick Navigation";
+        if (name === "function") return "dropdown";
+        if (name === "dropdown_placeholder") return "Go to section...";
+        if (name === "dropdown_options") return "Lobby | Return to main\nBanking | Open bank guide\nSupport | Create ticket";
+        return null;
+      },
+      getChannel: () => null,
+    },
+    editReply: async (payload) => {
+      replyPayload = payload;
+    },
+  };
+
+  await handleServerEmbedCommand(interaction);
+
+  assert.ok(replyPayload);
+  assert.equal(replyPayload.embeds.length, 1);
+  assert.equal(replyPayload.embeds[0].data.title, "Quick Navigation");
+  assert.equal(replyPayload.components.length, 1);
+  const selectMenu = replyPayload.components[0].toJSON().components[0];
+  assert.equal(selectMenu.placeholder, "Go to section...");
+  assert.equal(selectMenu.options.length, 3);
+  assert.equal(selectMenu.options[0].label, "Lobby");
+  assert.equal(selectMenu.options[1].label, "Banking");
+  assert.equal(selectMenu.options[2].label, "Support");
+});
+
+test("handleServerEmbedModalSubmit processes submitted dropdown options and posts embed", async () => {
+  const token = "test-modal-token-123";
+  pendingEmbedModalConfigs.set(token, {
+    embedData: {
+      title: "Interactive Bank Menu",
+      description: "Select an inquiry topic below.",
+      color: "#0B3D2E",
+      imageUrl: null,
+      thumbnailUrl: null,
+      footerText: "PTB Information Desk",
+    },
+    targetChannelId: "test-channel",
+    adminId: "admin-456",
+    createdAt: Date.now(),
+  });
+
+  let editReplyPayload = null;
+  const mockChannel = {
+    id: "test-channel",
+    send: async (msg) => msg,
+  };
+
+  const modalInteraction = {
+    customId: `server-embed-dropdown-modal:${token}`,
+    deferred: true,
+    replied: false,
+    channel: mockChannel,
+    client: {
+      channels: {
+        fetch: async () => mockChannel,
+      },
+    },
+    fields: {
+      getTextInputValue: (field) => {
+        if (field === "placeholder") return "Select bank service...";
+        if (field === "options") return "Open Account | Register for ledger\nDeposit Help | Receipt guidance\nTax Inquiries | Business bill info";
+        return "";
+      },
+    },
+    editReply: async (payload) => {
+      editReplyPayload = payload;
+    },
+  };
+
+  await handleServerEmbedModalSubmit(modalInteraction);
+
+  assert.ok(editReplyPayload);
+  assert.match(editReplyPayload.content, /Embed with dropdown successfully posted/);
+  assert.equal(pendingEmbedModalConfigs.has(token), false, "Pending token should be removed after posting");
+
+  // Error case: expired or non-existent token
+  let expiredReply = null;
+  const expiredInteraction = {
+    customId: "server-embed-dropdown-modal:expired-or-missing-token",
+    deferred: true,
+    editReply: async (payload) => {
+      expiredReply = payload;
+    },
+  };
+  await handleServerEmbedModalSubmit(expiredInteraction);
+  assert.match(expiredReply.content, /session has expired or was not found/);
+});
+
+test("handleServerEmbedDropdownSelect responds ephemerally with selected option details", async () => {
+  let selectReply = null;
+  const interaction = {
+    values: ["open_account"],
+    component: {
+      options: [
+        { label: "Open Account", value: "open_account", description: "Register for ledger" },
+        { label: "Deposit Help", value: "deposit_help", description: "Receipt guidance" },
+      ],
+    },
+    deferred: false,
+    replied: false,
+    reply: async (payload) => {
+      selectReply = payload;
+    },
+  };
+
+  await handleServerEmbedDropdownSelect(interaction);
+
+  assert.ok(selectReply);
+  assert.match(selectReply.content, /You selected \*\*Open Account\*\*/);
+  assert.match(selectReply.content, /> Register for ledger/);
+});
+
 

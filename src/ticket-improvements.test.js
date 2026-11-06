@@ -451,15 +451,14 @@ test("the real deposit-detection result shape renders through the shared deposit
     assert.equal(sent.length, 1);
     const embed = sent[0].embeds[0].data;
     assert.match(embed.title, /^Deposit receipt analysis · PTB-D-\d+$/);
-    assert.match(embed.description, /advisory/i);
+    assert.equal(embed.description, "The automated checks are advisory and still in beta testing.");
     const fields = new Map(embed.fields.map((field) => [field.name, field.value]));
-    assert.equal(fields.get("Amount & Currency"), "500 USD (matches ticket amount)");
+    assert.equal(embed.fields.length, 5);
+    assert.equal(fields.get("Amount"), "500 USD (matches ticket amount)");
     assert.equal(fields.get("Recipient"), "IRP Treasury");
-    assert.equal(fields.get("Sender / Payer"), "Alice_1");
-    assert.match(fields.get("Transaction ID"), /TX-987654/);
-    assert.match(fields.get("Receipt Status"), /completed/);
-    assert.equal(fields.get("OCR Confidence"), "91.5%");
-    assert.match(fields.get("Verified Payment Status"), /Pending staff approval/);
+    assert.equal(fields.get("Sender"), "Alice_1");
+    assert.match(fields.get("Time"), /^<t:\d+:f>$/);
+    assert.equal(fields.get("Confidence"), "91.5%");
 
     const check = await db.execute({
       sql: "SELECT ocr_text,extracted_payer,extracted_recipient,extracted_amount FROM treasury_ticket_receipt_checks WHERE ticket_id = ?",

@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 import { EmbedBuilder } from "discord.js";
 import { AMOUNT_MATCH, AMOUNT_MISMATCH, AMOUNT_NEEDS_REVIEW, checkScreenshotAmount, describeAmountComparison, identifyPaymentScreen } from "./amount-checker.js";
+import { formatOrdinal, formatImageLabel, resolveImageLabel } from "./ptb-embeds.js";
 import { ticketConfig } from "./ticket-config.js";
 import { logTicketEvent } from "./ticket-log.js";
 import { ticketCode } from "./ticket-ops.js";
+
+export { formatOrdinal, formatImageLabel, resolveImageLabel };
 
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp"]);
@@ -429,34 +432,46 @@ function buildFallbackEmbed(raw, context) {
   const comparison = analysis.amountComparison;
   const amountWithCurrency = analysis.extractedAmount === null
     ? null
-    : `${analysis.extractedAmount}${analysis.currency ? ` ${analysis.currency}` : ""}`;
-  const amountLine = amountWithCurrency === null
-    ? "Sent amount: not readable"
-    : `Amount: ${amountWithCurrency}${comparison === AMOUNT_MATCH ? " (matches ticket amount)" : comparison === AMOUNT_MISMATCH ? ` (ticket claims ${Number(ticket.amount).toLocaleString()})` : ""}`;
-  const duplicateLine = context.duplicateReference
-    ? `Duplicate: exact match to ${context.duplicateReference}`
-    : "Duplicate: no exact screenshot match found";
-  const findings = analysis.findings.length ? analysis.findings.join(", ") : "No OCR discrepancy detected";
-  const confidenceLine = Number.isFinite(analysis.confidence) && analysis.confidence > 0
-    ? `OCR confidence: ${analysis.confidence}${analysis.confidenceUnit === "percent" ? "%" : ""}`
-    : "OCR confidence: not reported";
-  const lines = [
-    `Payment screen: ${analysis.paymentScreenDetected ? "detected from OCR cues" : "not confidently identified"}`,
-    `Sender / payer (${context.claimedPayer || "account has no linked Roblox name"}): ${analysis.extractedPayer ? "matched from explicit sender text" : "not confirmed by OCR"}`,
-    `Recipient: ${analysis.extractedRecipient ?? "not confirmed by OCR"}`,
-    amountLine,
-    `Amount comparison: ${describeAmountComparison(comparison)}`,
-    duplicateLine,
-    `Transaction ID: ${analysis.transactionId ?? "not found"}`,
-    `Receipt status: ${analysis.paymentStatus ?? "not found"}`,
-    confidenceLine,
-    `Findings: ${findings}`,
-  ];
+    : `${Number(analysis.extractedAmount).toLocaleString()}${analysis.currency ? ` ${analysis.currency}` : ""}`;
+  let amountDisplay = "Not detected";
+  if (amountWithCurrency !== null) {
+    if (comparison === AMOUNT_MATCH) {
+      amountDisplay = `${amountWithCurrency} (matches ticket amount)`;
+    } else if (comparison === AMOUNT_MISMATCH && ticket?.amount) {
+      amountDisplay = `${amountWithCurrency} (ticket claims ${Number(ticket.amount).toLocaleString()})`;
+    } else {
+      amountDisplay = amountWithCurrency;
+    }
+  }
+
+  const confidenceDisplay = Number.isFinite(analysis.confidence) && analysis.confidence > 0
+    ? `${analysis.confidence}${analysis.confidenceUnit === "percent" ? "%" : ""}`
+    : "Not detected";
+
+  let unixTimestamp = null;
+  if (analysis.date) {
+    const parsed = Date.parse(analysis.time ? `${analysis.date} ${analysis.time}` : analysis.date);
+    if (!Number.isNaN(parsed)) unixTimestamp = Math.floor(parsed / 1000);
+  }
+  if (!unixTimestamp) {
+    const rawTs = context.timestamp ?? context.message?.createdTimestamp ?? Date.now();
+    const parsedTs = typeof rawTs === "number" ? rawTs : Date.parse(rawTs);
+    if (!Number.isNaN(parsedTs)) unixTimestamp = Math.floor(parsedTs / 1000);
+  }
+
+  const verifiedSender = context.claimedPayer || ticket?.requester_roblox_username || analysis.extractedPayer || "Not detected";
+
   return new EmbedBuilder()
-    .setColor(analysis.findings.length || context.duplicateReference ? 0xD97706 : 0x0B3D2E)
+    .setColor(analysis.findings.length || context.duplicateReference || comparison === AMOUNT_MISMATCH ? 0xD97706 : 0x0B3D2E)
     .setTitle(`Deposit receipt analysis · ${code}`)
-    .setDescription("Automated screenshot checks are advisory. Information extracted from screenshot OCR is unverified it could be unreliable and we do not hide that. Nothing was changed in your balance")
-    .addFields({ name: `Screenshot check for ${context.attachment.name ?? "receipt"}`.slice(0, 256), value: lines.join("\n").slice(0, 1024) })
+    .setDescription("The automated checks are advisory and still in beta testing.")
+    .addFields(
+      { name: "Amount", value: amountDisplay, inline: true },
+      { name: "Recipient", value: analysis.extractedRecipient ?? "Not detected", inline: true },
+      { name: "Sender", value: verifiedSender, inline: true },
+      { name: "Time", value: unixTimestamp ? `<t:${unixTimestamp}:f>` : "Not detected", inline: true },
+      { name: "Confidence", value: confidenceDisplay, inline: true },
+    )
     .setFooter({ text: "Receipt analysis only · no balance changes or automatic approvals" });
 }
 
@@ -478,10 +493,11 @@ async function renderAnalysisPayload(raw, context) {
 function buildErrorEmbed(context, error = null) {
   const detail = firstString(error?.message)?.replace(/^Receipt reader error:\s*/i, "");
   const detailLine = detail ? `\n\n**Reader response:** ${detail.slice(0, 300)}` : "";
+  const imageLabel = resolveImageLabel(context);
   return new EmbedBuilder()
     .setColor(0xD97706)
     .setTitle(`Receipt check unavailable · ${ticketCode(context.ticket)}`)
-    .setDescription(`I could not analyze **${context.attachment.name ?? "the uploaded image"}**. The ticket is unchanged and still needs human review. You can upload a clearer screenshot or ask ticket staff to inspect this one manually.${detailLine}`)
+    .setDescription(`I could not analyze **${imageLabel}**. The ticket is unchanged and still needs human review. You can upload a clearer screenshot or ask ticket staff to inspect this one manually.${detailLine}`)
     .setFooter({ text: "No balance changes or automatic approvals were made." });
 }
 
@@ -513,6 +529,17 @@ export async function handleDepositTicketImage(db, message) {
   const config = ticketConfig();
   let postedAny = false;
 
+  let currentImageCount = 0;
+  try {
+    const existing = await db.execute({
+      sql: "SELECT COUNT(*) as count FROM ticket_receipt_processing WHERE ticket_id = ?",
+      args: [ticket.id],
+    });
+    currentImageCount = Number(existing.rows[0]?.count ?? 0);
+  } catch {
+    currentImageCount = 0;
+  }
+
   for (const attachment of message.attachments.values()) {
     if (!isEligibleAttachment(attachment)) continue;
     const claimed = await claimAttachment(db, ticket.id, attachment, message.id);
@@ -521,10 +548,21 @@ export async function handleDepositTicketImage(db, message) {
       continue;
     }
 
+    currentImageCount += 1;
+    const imageIndex = currentImageCount;
+    const username = message.author?.username
+      || message.member?.displayName
+      || claimedPayer
+      || "user";
+    const imageLabel = formatImageLabel({ username, index: imageIndex });
+
     const context = {
       ticket,
       attachment,
       message,
+      imageIndex,
+      imageLabel,
+      username,
       claimedAmount: ticket.amount,
       claimedPayer,
       normalized: null,
@@ -561,7 +599,7 @@ export async function handleDepositTicketImage(db, message) {
         action: "RECEIPT_ANALYSIS_POSTED",
         ticket,
         actorId: message.author.id,
-        details: `Attachment ${attachment.name ?? attachmentKey(attachment)} analyzed in <#${message.channelId}>.`,
+        details: `${imageLabel} analyzed in <#${message.channelId}>.`,
       }, { config });
     } catch (error) {
       console.warn(`[PTB Deposit] Receipt analysis failed for ${ticketCode(ticket)}:`, error?.message ?? error);
@@ -577,7 +615,7 @@ export async function handleDepositTicketImage(db, message) {
         ticket,
         actorId: message.author.id,
         reason: error?.message ?? String(error),
-        details: `Attachment ${attachment.name ?? attachmentKey(attachment)} could not be analyzed.`,
+        details: `${imageLabel} could not be analyzed.`,
       }, { config });
     }
   }

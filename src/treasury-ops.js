@@ -432,12 +432,12 @@ export async function submitTreasuryPayment(db, interaction, { reviewChannelId, 
       console.error("Could not post treasury review item:", error);
       await db.execute({ sql: "UPDATE treasury_submissions SET status='NEEDS_REVIEW', updated_at=CURRENT_TIMESTAMP WHERE reference=? AND status='PENDING'", args: [reference] });
       await audit(db, reference, interaction.user.id, "REVIEW_CHANNEL_DELIVERY_FAILED", status, "NEEDS_REVIEW", "Could not deliver review message");
-      return interaction.editReply(`Receipt ${reference} is recorded as NEEDS_REVIEW, but the review channel could not be notified. Please contact treasury staff.`);
+      return interaction.editReply("Your submission is recorded as NEEDS_REVIEW, but the review channel could not be notified. Please contact treasury staff.");
     }
   } else {
     await db.execute({ sql: "UPDATE treasury_submissions SET status='NEEDS_REVIEW', updated_at=CURRENT_TIMESTAMP WHERE reference=? AND status='PENDING'", args: [reference] });
     await audit(db, reference, interaction.user.id, "NO_REVIEW_CHANNEL_CONFIGURED", status, "NEEDS_REVIEW", "No review channel configured");
-    return interaction.editReply(`Receipt **${reference}** has been recorded for review. (A dedicated #treasury-review channel is not yet configured on this server; treasury staff can review via the ledger).`);
+    return interaction.editReply("Your submission has been recorded for review. (A dedicated #treasury-review channel is not yet configured on this server; treasury staff can review via the ledger).");
   }
   await interaction.editReply(buildAmountCheckerMessage({
     comparison: row.amount_comparison ?? analysis.amountCheck?.comparison ?? AMOUNT_NEEDS_REVIEW,

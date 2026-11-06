@@ -140,18 +140,24 @@ test("player reply matches the PTB response spec for all three outcomes", () => 
   assert.match(match, /Screenshot amount: \$5,000/);
   assert.match(match, /The amounts match\./);
   assert.match(match, /Status: Pending manual verification\./);
+  assert.doesNotMatch(match, /IRPT-000001/);
+  assert.match(match, /The bot could be unreliable and may make mistakes/);
 
   const mismatch = buildAmountCheckerMessage({ comparison: AMOUNT_MISMATCH, claimedAmount: 5000, extractedAmount: 3000, status: "NEEDS_REVIEW", reference: "IRPT-000002" });
   assert.match(mismatch, /🔴 Amount Mismatch/);
   assert.match(mismatch, /Claimed amount: \$5,000/);
   assert.match(mismatch, /Screenshot amount: \$3,000/);
   assert.match(mismatch, /The amounts do not match\./);
-  assert.match(mismatch, /Status: Flagged for review\./);
+  assert.doesNotMatch(mismatch, /Flagged for review/);
+  assert.doesNotMatch(mismatch, /IRPT-000002/);
+  assert.match(mismatch, /The bot could be unreliable and may make mistakes/);
 
   const unreadable = buildAmountCheckerMessage({ comparison: AMOUNT_NEEDS_REVIEW, claimedAmount: 5000, extractedAmount: null, status: "NEEDS_REVIEW", reference: "IRPT-000003" });
   assert.match(unreadable, /🟡 Unable to Read Amount/);
   assert.match(unreadable, /could not confidently identify/);
   assert.match(unreadable, /Please submit a clearer screenshot\./);
   assert.match(unreadable, /Status: Needs review\./);
+  assert.doesNotMatch(unreadable, /IRPT-000003/);
   assert.doesNotMatch(unreadable, /Claimed amount:/);
+  assert.match(unreadable, /The bot could be unreliable and may make mistakes/);
 });

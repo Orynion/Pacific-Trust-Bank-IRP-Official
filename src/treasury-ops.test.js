@@ -74,8 +74,8 @@ test("submission records exact screenshot duplicates and keeps them for review",
     assert.equal(rows.rows[0].reference, "IRPT-000001");
     assert.equal(rows.rows[1].status, "DUPLICATE");
     assert.equal(rows.rows[1].duplicate_of, "IRPT-000001");
-    assert.ok(rows.rows[0].perceptual_hash);
-    assert.match(results[0], /IRPT-000001/);
+    assert.doesNotMatch(results[0], /IRPT-/);
+    assert.match(results[0], /The bot could be unreliable/);
   } finally { globalThis.fetch = originalFetch; await db.close(); }
 });
 
@@ -149,8 +149,9 @@ test("first image in a pending deposit ticket gets an advisory detection report"
     };
     assert.equal(await handleDepositTicketImage(db, message), true);
     assert.match(sent.embeds[0].data.title, /Deposit receipt analysis/);
-    assert.match(sent.embeds[0].data.fields[0].value, /Payment screen: detected from OCR cues/);
-    assert.match(sent.embeds[0].data.fields[0].value, /Amount: 500 \(matches ticket amount\)/);
+    assert.equal(sent.embeds[0].data.description, "The automated checks are advisory and still in beta testing.");
+    assert.equal(sent.embeds[0].data.fields[0].name, "Amount");
+    assert.match(sent.embeds[0].data.fields[0].value, /500 \(matches ticket amount\)/);
     const saved = await db.execute("SELECT ticket_id,extracted_amount,ocr_text FROM treasury_ticket_receipt_checks");
     assert.equal(Number(saved.rows[0].ticket_id), 7);
     assert.match(saved.rows[0].ocr_text, /Payment Successful/);
@@ -197,7 +198,7 @@ test("amount checker replies MATCH, records the comparison, and keeps manual ver
     assert.match(replies[0], /Claimed amount: \$5,000/);
     assert.match(replies[0], /Screenshot amount: \$5,000/);
     assert.match(replies[0], /Status: Pending manual verification\./);
-    assert.match(replies[0], /IRPT-000001/);
+    assert.doesNotMatch(replies[0], /IRPT-/);
     const row = await db.execute("SELECT status,amount,extracted_amount,amount_comparison,findings FROM treasury_submissions WHERE reference='IRPT-000001'");
     assert.equal(row.rows[0].status, "PENDING");
     assert.equal(Number(row.rows[0].extracted_amount), 5000);
@@ -218,8 +219,8 @@ test("amount checker replies MISMATCH and flags the submission for review", asyn
     assert.match(replies[0], /Claimed amount: \$5,000/);
     assert.match(replies[0], /Screenshot amount: \$3,000/);
     assert.match(replies[0], /The amounts do not match\./);
-    assert.match(replies[0], /Status: Flagged for review\./);
-    assert.match(replies[0], /IRPT-000001/);
+    assert.doesNotMatch(replies[0], /Flagged for review/);
+    assert.doesNotMatch(replies[0], /IRPT-/);
     const row = await db.execute("SELECT status,extracted_amount,amount_comparison,findings FROM treasury_submissions WHERE reference='IRPT-000001'");
     assert.equal(row.rows[0].status, "NEEDS_REVIEW");
     assert.equal(Number(row.rows[0].extracted_amount), 3000);
@@ -236,7 +237,7 @@ test("amount checker replies Unable to Read when OCR cannot identify an amount",
     assert.match(replies[0], /🟡 Unable to Read Amount/);
     assert.match(replies[0], /Please submit a clearer screenshot\./);
     assert.match(replies[0], /Status: Needs review\./);
-    assert.match(replies[0], /IRPT-000001/);
+    assert.doesNotMatch(replies[0], /IRPT-/);
     const row = await db.execute("SELECT status,extracted_amount,amount_comparison,findings FROM treasury_submissions WHERE reference='IRPT-000001'");
     assert.equal(row.rows[0].status, "NEEDS_REVIEW");
     assert.equal(row.rows[0].extracted_amount, null);
