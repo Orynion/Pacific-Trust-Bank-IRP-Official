@@ -36,7 +36,9 @@ import { ensureAmountComparisonColumn, handleTreasuryButton, handleTreasuryModal
 import {
   handleServerEmbedCommand,
   handleServerEmbedDropdownSelect,
+  handleServerEmbedDynamicModalSubmit,
   handleServerEmbedModalSubmit,
+  handleServerEmbedOptionCountClick,
   serverEmbedCommand,
 } from "./ptb-embeds.js";
 
@@ -605,6 +607,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     return;
   }
+  if (interaction.isModalSubmit() && interaction.customId.startsWith("server-embed-dynamic-modal:")) {
+    try {
+      await handleServerEmbedDynamicModalSubmit(interaction);
+    } catch (error) {
+      console.error("PTB server embed dynamic modal failed:", error);
+      await respond(interaction, { content: "I could not post that embed with dropdown.", ...ephemeralReply })
+        .catch((replyError) => console.error("Could not send embed modal error reply:", replyError));
+    }
+    return;
+  }
   if (interaction.isModalSubmit() && interaction.customId.startsWith("server-embed-dropdown-modal:")) {
     try {
       await handleServerEmbedModalSubmit(interaction);
@@ -626,6 +638,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
   if (interaction.isButton()) {
+    if (interaction.customId.startsWith("embed-opts-count:")) {
+      try {
+        await handleServerEmbedOptionCountClick(interaction);
+      } catch (error) {
+        console.error("PTB server embed option count click failed:", error);
+        await respond(interaction, { content: "I could not open the options setup modal.", ...ephemeralReply })
+          .catch((replyError) => console.error("Could not send embed options button error reply:", replyError));
+      }
+      return;
+    }
     const treasuryMatch = interaction.customId.match(/^trv-(approve|approve-confirm|reject|info|flag):(IRPT-\d+)$/);
     if (treasuryMatch) {
       try { await handleTreasuryButton(db, interaction, treasuryMatch[1], treasuryMatch[2], TREASURY_REVIEW_ROLES); }

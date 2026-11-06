@@ -35,6 +35,8 @@ import {
   pendingEmbedModalConfigs,
   serverEmbedCommand,
   handleServerEmbedModalSubmit,
+  handleServerEmbedOptionCountClick,
+  handleServerEmbedDynamicModalSubmit,
   handleServerEmbedDropdownSelect,
 } from "./ptb-embeds.js";
 
@@ -435,11 +437,11 @@ test("createServerEmbedCommand configures administrator permissions and options"
   const optionNames = json.options.map((o) => o.name);
   assert.ok(optionNames.includes("title"));
   assert.ok(optionNames.includes("description"));
-  assert.ok(optionNames.includes("options"));
   assert.ok(optionNames.includes("function"));
   assert.ok(optionNames.includes("color"));
   assert.ok(optionNames.includes("image_url"));
   assert.ok(optionNames.includes("footer"));
+  assert.equal(optionNames.includes("options"), false, "options input removed from slash command");
   assert.equal(optionNames.includes("channel"), false, "channel is removed from server-embed");
   assert.equal(optionNames.includes("thumbnail"), false, "thumbnail is removed from server-embed");
   assert.equal(optionNames.includes("image"), false, "duplicate image option is removed from server-embed");
@@ -614,13 +616,14 @@ test("serverEmbedCommand and handleServerEmbedCommand support image_url, color v
   const optionNames = json.options.map((o) => o.name);
   assert.ok(optionNames.includes("title"));
   assert.ok(optionNames.includes("description"));
+  assert.ok(optionNames.includes("function"));
   assert.ok(optionNames.includes("color"));
   assert.ok(optionNames.includes("image_url"));
   assert.ok(optionNames.includes("footer"));
-  assert.ok(optionNames.includes("options"), "options must exist in debloated command");
+  assert.equal(optionNames.includes("options"), false, "options input removed from slash command");
   assert.equal(optionNames.includes("channel"), false, "channel must be removed from command");
   assert.equal(optionNames.includes("thumbnail"), false, "thumbnail must be removed from command");
-  assert.equal(optionNames.includes("dropdown_options"), false, "dropdown_options renamed to options");
+  assert.equal(optionNames.includes("dropdown_options"), false, "dropdown_options removed");
   assert.equal(optionNames.includes("dropdown_placeholder"), false, "dropdown_placeholder removed from command");
 
   let editReplyPayload = null;
@@ -747,8 +750,8 @@ test("buildDropdownComponent constructs ActionRow with StringSelectMenuBuilder",
   assert.equal(menu.options[0].description, "First choice");
 });
 
-test("handleServerEmbedCommand displays modal when function:dropdown is selected without inline options", async () => {
-  let modalShown = null;
+test("handleServerEmbedCommand asks for number of options when function:dropdown is selected and generates dynamic modal", async () => {
+  let replyPayload = null;
   const interaction = {
     member: {
       permissions: {
@@ -768,29 +771,77 @@ test("handleServerEmbedCommand displays modal when function:dropdown is selected
         if (name === "title") return "Server Rules & Roles";
         if (name === "description") return "Select your department below.";
         if (name === "function") return "dropdown";
-        if (name === "dropdown_placeholder") return "Choose your department...";
         return null;
       },
       getChannel: () => null,
     },
-    showModal: async (modal) => {
-      modalShown = modal;
+    reply: async (payload) => {
+      replyPayload = payload;
     },
-    reply: async () => {},
   };
 
   await handleServerEmbedCommand(interaction);
 
-  assert.ok(modalShown, "Modal should have been presented to administrator");
-  const modalData = modalShown.toJSON();
-  assert.equal(modalData.title, "Configure Dropdown Menu");
-  assert.match(modalData.custom_id, /^server-embed-dropdown-modal:[a-z0-9]+$/);
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /# Configure Dropdown Menu/);
+  assert.match(replyPayload.content, /-# Select the number of options below/);
+  assert.equal(replyPayload.components.length, 1);
+  const buttons = replyPayload.components[0].toJSON().components;
+  assert.equal(buttons.length, 5);
+  assert.equal(buttons[0].label, "1 Option");
+  assert.equal(buttons[2].label, "3 Options");
 
-  const token = modalData.custom_id.replace("server-embed-dropdown-modal:", "");
-  assert.ok(pendingEmbedModalConfigs.has(token), "Pending embed configuration stored");
-  const pending = pendingEmbedModalConfigs.get(token);
-  assert.equal(pending.embedData.title, "Server Rules & Roles");
-  assert.equal(pending.adminId, "admin-user-123");
+  // Verify token in customId
+  const customId = buttons[2].custom_id;
+  assert.match(customId, /^embed-opts-count:[a-z0-9]+:3$/);
+  const token = customId.split(":")[1];
+  assert.ok(pendingEmbedModalConfigs.has(token));
+  assert.equal(pendingEmbedModalConfigs.get(token).embedData.title, "Server Rules & Roles");
+
+  // Now test clicking the 3 Options button:
+  let dynamicModalShown = null;
+  const buttonInteraction = {
+    customId,
+    user: { id: "admin-user-123" },
+    showModal: async (modal) => { dynamicModalShown = modal; },
+  };
+
+  await handleServerEmbedOptionCountClick(buttonInteraction);
+  assert.ok(dynamicModalShown);
+  const modalData = dynamicModalShown.toJSON();
+  assert.match(modalData.custom_id, new RegExp(`^server-embed-dynamic-modal:${token}:3$`));
+  // 3 options + 1 placeholder = 4 components
+  assert.equal(modalData.components.length, 4);
+  assert.equal(modalData.components[0].components[0].custom_id, "placeholder");
+  assert.equal(modalData.components[1].components[0].custom_id, "opt_1");
+  assert.equal(modalData.components[2].components[0].custom_id, "opt_2");
+  assert.equal(modalData.components[3].components[0].custom_id, "opt_3");
+
+  // Now test submitting this dynamic modal:
+  let editReplyPayload = null;
+  const mockChannel = { id: "channel-999", send: async (msg) => msg };
+  const dynamicSubmitInteraction = {
+    customId: `server-embed-dynamic-modal:${token}:3`,
+    deferred: true,
+    replied: false,
+    channel: mockChannel,
+    fields: {
+      getTextInputValue: (id) => {
+        if (id === "placeholder") return "Choose department...";
+        if (id === "opt_1") return "Deposit Desk | Cash deposits";
+        if (id === "opt_2") return "Withdrawals | Cash withdrawals";
+        if (id === "opt_3") return "Support Tickets | Open staff ticket";
+        return "";
+      },
+    },
+    editReply: async (payload) => { editReplyPayload = payload; },
+  };
+
+  await handleServerEmbedDynamicModalSubmit(dynamicSubmitInteraction);
+  assert.ok(editReplyPayload);
+  assert.match(editReplyPayload.content, /# Dropdown Embed Published/);
+  assert.match(editReplyPayload.content, /-# Pacific Trust Bank • Interactive Menu/);
+  assert.equal(pendingEmbedModalConfigs.has(token), false, "Pending token should be removed after publishing");
 });
 
 test("handleServerEmbedCommand creates embed and dropdown directly when options are provided", async () => {
@@ -914,9 +965,10 @@ test("handleServerEmbedDropdownSelect differentiates options and reaches appropr
 
   await handleServerEmbedDropdownSelect(depositInteraction);
   assert.ok(depositReply);
-  assert.match(depositReply.content, /You selected \*\*Deposit Help\*\*/);
+  assert.match(depositReply.content, /# Deposit Help/);
   assert.match(depositReply.content, /> How to deposit cash/);
   assert.match(depositReply.content, /Run `\/deposit` with your amount/);
+  assert.match(depositReply.content, /-# Pacific Trust Bank • Interactive Menu/);
 
   // Test 2: Link differentiation with Action Button (Website portal)
   let linkReply = null;
@@ -936,8 +988,9 @@ test("handleServerEmbedDropdownSelect differentiates options and reaches appropr
 
   await handleServerEmbedDropdownSelect(linkInteraction);
   assert.ok(linkReply);
-  assert.match(linkReply.content, /You selected \*\*Official Portal\*\*/);
+  assert.match(linkReply.content, /# Official Portal/);
   assert.match(linkReply.content, /\[Click here to open\]\(https:\/\/ptb\.example\.com\)/);
+  assert.match(linkReply.content, /-# Pacific Trust Bank • Interactive Menu/);
   assert.ok(linkReply.components?.length === 1, "Should attach Link Button component");
   const linkButton = linkReply.components[0].toJSON().components[0];
   assert.equal(linkButton.type, 2); // Button
@@ -962,8 +1015,9 @@ test("handleServerEmbedDropdownSelect differentiates options and reaches appropr
 
   await handleServerEmbedDropdownSelect(generalInteraction);
   assert.ok(generalReply);
-  assert.match(generalReply.content, /You selected \*\*PTB History\*\*/);
+  assert.match(generalReply.content, /# PTB History/);
   assert.match(generalReply.content, /> Founded in Hamburg in 1982/);
+  assert.match(generalReply.content, /-# Pacific Trust Bank • Interactive Menu/);
   assert.equal(generalReply.components, undefined);
 });
 

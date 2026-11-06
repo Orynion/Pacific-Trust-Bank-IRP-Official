@@ -1174,7 +1174,7 @@ export const pendingEmbedModalConfigs = new Map();
 
 /**
  * Slash command definition for /server-embed with dropdown support.
- * Debloated, streamlined options without redundant fields or channel selectors.
+ * Debloated, streamlined options without redundant fields, options text, or channel selectors.
  */
 export const serverEmbedCommand = new SlashCommandBuilder()
   .setName("server-embed")
@@ -1189,11 +1189,6 @@ export const serverEmbedCommand = new SlashCommandBuilder()
       .setDescription("Embed description")
       .setRequired(false)
       .setMaxLength(4096))
-  .addStringOption((o) =>
-    o.setName("options")
-      .setDescription("Dropdown options (e.g. Option 1 | Details, Option 2 | Details)")
-      .setRequired(false)
-      .setMaxLength(2000))
   .addStringOption((o) =>
     o.setName("function")
       .setDescription("Embed functionality (select 'dropdown' to configure interactive menu)")
@@ -1230,7 +1225,8 @@ export function createServerEmbedCommand() {
 /**
  * Handles `/server-embed` command execution.
  * Enforces administrator permissions, validates all inputs, and delivers the embed
- * directly in the current channel with optional interactive dropdown menu.
+ * directly in the current channel. If function:dropdown is selected, asks for the
+ * number of options so dynamic modal fields can be generated.
  *
  * @param {import("discord.js").ChatInputCommandInteraction} interaction
  * @returns {Promise<void>}
@@ -1244,7 +1240,7 @@ export async function handleServerEmbedCommand(interaction) {
 
   if (!hasAdmin) {
     const errorPayload = {
-      content: "Only server administrators can use the `/server-embed` command.",
+      content: "# Access Denied\nOnly server administrators can use the `/server-embed` command.\n-# Pacific Trust Bank • Staff Administration",
       flags: MessageFlags.Ephemeral,
     };
     if (typeof interaction.reply === "function") {
@@ -1259,64 +1255,9 @@ export async function handleServerEmbedCommand(interaction) {
   const imageUrlInput = interaction.options.getString("image_url") || interaction.options.getString?.("image");
   const footerText = interaction.options.getString("footer");
   const functionChoice = interaction.options.getString?.("function");
-  // Accept debloated "options", and support "dropdown_options" for backwards compatibility
   const optionsRaw = interaction.options.getString?.("options") || interaction.options.getString?.("dropdown_options");
 
-  // Differentiate dropdown functionality:
-  // If function:dropdown selected without options provided, open modal so admin can fill out options
-  const wantsDropdownModal = (functionChoice === "dropdown" && !optionsRaw);
-  if (wantsDropdownModal && typeof interaction.showModal === "function" && !interaction.deferred && !interaction.replied) {
-    try {
-      if (colorInput) parseEmbedColor(colorInput);
-      if (imageUrlInput) validateImageUrl(imageUrlInput);
-    } catch (err) {
-      return interaction.reply({ content: `⚠️ ${err.message}`, flags: MessageFlags.Ephemeral });
-    }
-
-    const token = Math.random().toString(36).slice(2, 10);
-    pendingEmbedModalConfigs.set(token, {
-      embedData: { title, description, color: colorInput, imageUrl: imageUrlInput, footerText },
-      channelId: interaction.channelId || interaction.channel?.id,
-      createdAt: Date.now(),
-      adminId: interaction.user?.id,
-    });
-
-    const modal = new ModalBuilder()
-      .setCustomId(`server-embed-dropdown-modal:${token}`)
-      .setTitle("Configure Dropdown Menu");
-
-    const placeholderInput = new TextInputBuilder()
-      .setCustomId("placeholder")
-      .setLabel("Dropdown Placeholder")
-      .setStyle(TextInputStyle.Short)
-      .setPlaceholder("Select an option...")
-      .setValue("Select an option...")
-      .setRequired(false)
-      .setMaxLength(150);
-
-    const optionsInput = new TextInputBuilder()
-      .setCustomId("options")
-      .setLabel("Dropdown Options (one per line: Label | Desc)")
-      .setStyle(TextInputStyle.Paragraph)
-      .setPlaceholder("Option 1 | Details about option 1\nOption 2 | Details about option 2\nOption 3")
-      .setRequired(true)
-      .setMaxLength(2000);
-
-    modal.addComponents(
-      new ActionRowBuilder().addComponents(placeholderInput),
-      new ActionRowBuilder().addComponents(optionsInput),
-    );
-
-    await interaction.showModal(modal);
-    return;
-  }
-
-  // Defer reply if available and not already acknowledged
-  if (typeof interaction.deferReply === "function" && !interaction.deferred && !interaction.replied) {
-    await interaction.deferReply().catch(() => {});
-  }
-
-  // 2. Parse and validate inputs with user-friendly error messages
+  // Validate color and image URL
   let color;
   let imageUrl = null;
   try {
@@ -1330,6 +1271,37 @@ export async function handleServerEmbedCommand(interaction) {
     return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
   }
 
+  // 2. If function:dropdown is chosen and no pre-supplied options:
+  // Ask for the number of options so it creates fields dynamically!
+  if (functionChoice === "dropdown" && !optionsRaw) {
+    const token = Math.random().toString(36).slice(2, 10);
+    pendingEmbedModalConfigs.set(token, {
+      embedData: { title, description, color: colorInput, imageUrl: imageUrlInput, footerText },
+      channelId: interaction.channelId || interaction.channel?.id,
+      createdAt: Date.now(),
+      adminId: interaction.user?.id,
+    });
+
+    const promptContent = `# Configure Dropdown Menu\nHow many options would you like in the dropdown for **${title}**?\n-# Select the number of options below. A modal will open with dedicated fields for each option.`;
+    const countRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`embed-opts-count:${token}:1`).setLabel("1 Option").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`embed-opts-count:${token}:2`).setLabel("2 Options").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`embed-opts-count:${token}:3`).setLabel("3 Options").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`embed-opts-count:${token}:4`).setLabel("4 Options").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`embed-opts-count:${token}:5`).setLabel("5 Options").setStyle(ButtonStyle.Primary),
+    );
+
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ content: promptContent, components: [countRow] });
+    }
+    return interaction.reply({ content: promptContent, components: [countRow], flags: MessageFlags.Ephemeral });
+  }
+
+  // Defer reply if available and not already acknowledged
+  if (typeof interaction.deferReply === "function" && !interaction.deferred && !interaction.replied) {
+    await interaction.deferReply().catch(() => {});
+  }
+
   // 3. Assemble the embed object
   const embed = new EmbedBuilder()
     .setTitle(title)
@@ -1339,7 +1311,7 @@ export async function handleServerEmbedCommand(interaction) {
   if (imageUrl) embed.setImage(imageUrl);
   if (footerText) embed.setFooter({ text: footerText });
 
-  // 4. Build dropdown component if options are provided or function is dropdown
+  // 4. Build dropdown component if options are provided
   let components = [];
   if (optionsRaw) {
     const parsedOptions = parseDropdownOptions(optionsRaw);
@@ -1358,7 +1330,7 @@ export async function handleServerEmbedCommand(interaction) {
     try {
       await interaction.channel.send({ embeds: [embed], components });
       return interaction.reply({
-        content: `Embed successfully posted in <#${interaction.channel.id}>.`,
+        content: `# Embed Published\nEmbed successfully posted in <#${interaction.channel.id}>.\n-# Pacific Trust Bank • Staff Administration`,
         flags: MessageFlags.Ephemeral,
       });
     } catch {
@@ -1373,7 +1345,146 @@ export async function handleServerEmbedCommand(interaction) {
 }
 
 /**
- * Handles modal submissions for the server-embed dropdown configuration.
+ * Handles button clicks when the administrator selects how many options to configure.
+ * Dynamically builds a Discord modal with fields for each option.
+ *
+ * @param {import("discord.js").ButtonInteraction} interaction
+ * @returns {Promise<void>}
+ */
+export async function handleServerEmbedOptionCountClick(interaction) {
+  const parts = interaction.customId.split(":");
+  const token = parts[1];
+  const count = Math.min(5, Math.max(1, parseInt(parts[2], 10) || 1));
+
+  const pending = pendingEmbedModalConfigs.get(token);
+  if (!pending) {
+    const errorMsg = "# Session Expired\n⚠️ This embed configuration session has expired. Please run `/server-embed` again.\n-# Pacific Trust Bank • Staff Administration";
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ content: errorMsg });
+    }
+    return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
+  }
+
+  if (pending.adminId && interaction.user?.id && interaction.user.id !== pending.adminId) {
+    const errorMsg = "⚠️ Only the administrator who started this command can configure it.";
+    return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`server-embed-dynamic-modal:${token}:${count}`)
+    .setTitle(`Configure ${count} Dropdown Option${count === 1 ? "" : "s"}`.slice(0, 45));
+
+  // If count <= 4, include a placeholder field (max 5 ActionRows per modal)
+  if (count <= 4) {
+    const placeholderInput = new TextInputBuilder()
+      .setCustomId("placeholder")
+      .setLabel("Dropdown Placeholder")
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder("Select an option...")
+      .setValue("Select an option...")
+      .setRequired(false)
+      .setMaxLength(150);
+    modal.addComponents(new ActionRowBuilder().addComponents(placeholderInput));
+  }
+
+  // Dynamically add a field for each requested option
+  for (let i = 1; i <= count; i++) {
+    const optionInput = new TextInputBuilder()
+      .setCustomId(`opt_${i}`)
+      .setLabel(`Option ${i} (Label | Description | Link)`.slice(0, 45))
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder(`e.g. Option ${i} | Details about option ${i}`)
+      .setRequired(true)
+      .setMaxLength(300);
+    modal.addComponents(new ActionRowBuilder().addComponents(optionInput));
+  }
+
+  await interaction.showModal(modal);
+}
+
+/**
+ * Handles dynamic modal submissions where the administrator filled in each dynamic option field.
+ *
+ * @param {import("discord.js").ModalSubmitInteraction} interaction
+ * @returns {Promise<void>}
+ */
+export async function handleServerEmbedDynamicModalSubmit(interaction) {
+  const parts = interaction.customId.split(":");
+  const token = parts[1];
+  const count = parseInt(parts[2], 10) || 1;
+
+  const pending = pendingEmbedModalConfigs.get(token);
+  if (!pending) {
+    const errorMsg = "# Session Expired\n⚠️ This embed configuration session has expired. Please run `/server-embed` again.\n-# Pacific Trust Bank • Staff Administration";
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ content: errorMsg });
+    }
+    return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
+  }
+
+  if (typeof interaction.deferReply === "function" && !interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+
+  const placeholder = interaction.fields?.getTextInputValue?.("placeholder") || "Select an option...";
+  const rawOptionLines = [];
+  for (let i = 1; i <= count; i++) {
+    const val = interaction.fields?.getTextInputValue?.(`opt_${i}`)?.trim();
+    if (val) rawOptionLines.push(val);
+  }
+
+  const parsedOptions = parseDropdownOptions(rawOptionLines.join("\n"));
+  if (parsedOptions.length === 0) {
+    const errorMsg = "⚠️ Please provide at least one valid dropdown option (e.g. `Option 1 | Description`).";
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ content: errorMsg });
+    }
+    return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
+  }
+
+  const { title, description, color, imageUrl, footerText } = pending.embedData;
+  const parsedColor = parseEmbedColor(color);
+  const embed = new EmbedBuilder().setTitle(title).setColor(parsedColor);
+  if (description) embed.setDescription(description);
+  if (imageUrl) embed.setImage(imageUrl);
+  if (footerText) embed.setFooter({ text: footerText });
+
+  const row = buildDropdownComponent({
+    placeholder: parsedOptions.placeholder || placeholder,
+    options: parsedOptions,
+  });
+  const components = row ? [row] : [];
+
+  const targetChannel = interaction.channel;
+
+  try {
+    if (targetChannel && typeof targetChannel.send === "function") {
+      await targetChannel.send({ embeds: [embed], components });
+      pendingEmbedModalConfigs.delete(token);
+      const confirmation = `# Dropdown Embed Published\nEmbed with **${parsedOptions.length}** interactive options successfully posted in <#${targetChannel.id}>.\n-# Pacific Trust Bank • Interactive Menu`;
+      if (interaction.deferred || interaction.replied) {
+        return interaction.editReply({ content: confirmation });
+      }
+      return interaction.reply({ content: confirmation, flags: MessageFlags.Ephemeral });
+    } else {
+      pendingEmbedModalConfigs.delete(token);
+      if (interaction.deferred || interaction.replied) {
+        return interaction.editReply({ embeds: [embed], components });
+      }
+      return interaction.reply({ embeds: [embed], components });
+    }
+  } catch (error) {
+    console.error("[PTB Embed] Failed to send embed with dropdown:", error);
+    const errorMsg = `Failed to deliver embed: ${error?.message || "Unknown error"}`;
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ content: errorMsg });
+    }
+    return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
+  }
+}
+
+/**
+ * Handles modal submissions for the server-embed dropdown configuration (single-modal fallback).
  *
  * @param {import("discord.js").ModalSubmitInteraction} interaction
  * @returns {Promise<void>}
@@ -1383,7 +1494,7 @@ export async function handleServerEmbedModalSubmit(interaction) {
   const pending = pendingEmbedModalConfigs.get(token);
 
   if (!pending) {
-    const errorMsg = "⚠️ This embed configuration session has expired or was not found. Please run `/server-embed` again.";
+    const errorMsg = "# Session Expired\n⚠️ This embed configuration session has expired or was not found. Please run `/server-embed` again.\n-# Pacific Trust Bank • Staff Administration";
     if (interaction.deferred || interaction.replied) {
       return interaction.editReply({ content: errorMsg });
     }
@@ -1425,7 +1536,7 @@ export async function handleServerEmbedModalSubmit(interaction) {
     if (targetChannel && typeof targetChannel.send === "function") {
       await targetChannel.send({ embeds: [embed], components });
       pendingEmbedModalConfigs.delete(token);
-      const confirmation = `Embed with dropdown successfully posted in <#${targetChannel.id}>.`;
+      const confirmation = `# Dropdown Embed Published\nEmbed with dropdown successfully posted in <#${targetChannel.id}>.\n-# Pacific Trust Bank • Interactive Menu`;
       if (interaction.deferred || interaction.replied) {
         return interaction.editReply({ content: confirmation });
       }
@@ -1450,7 +1561,7 @@ export async function handleServerEmbedModalSubmit(interaction) {
 /**
  * Handles interactions when a user selects an item from a server-embed dropdown.
  * Differentiates option functionality (links, banking actions, guidance) to make
- * dropdown options genuinely actionable.
+ * dropdown options genuinely actionable, formatted with # (bold) and -# (small subtext).
  *
  * @param {import("discord.js").StringSelectMenuInteraction} interaction
  * @returns {Promise<void>}
@@ -1496,7 +1607,7 @@ export async function handleServerEmbedDropdownSelect(interaction) {
     actionAdvice = "\n\n💡 **Action:** Use `/deposit` or `/withdraw` to open a private ticket with bank staff.";
   }
 
-  const responseContent = `You selected **${label}**${desc}${actionAdvice}`;
+  const responseContent = `# ${label}${desc}${actionAdvice}\n-# Pacific Trust Bank • Interactive Menu`;
   const responsePayload = {
     content: responseContent,
     flags: MessageFlags.Ephemeral,
@@ -1549,6 +1660,8 @@ export default {
   createServerEmbedCommand,
   handleServerEmbedCommand,
   handleServerEmbedModalSubmit,
+  handleServerEmbedOptionCountClick,
+  handleServerEmbedDynamicModalSubmit,
   handleServerEmbedDropdownSelect,
 };
 
