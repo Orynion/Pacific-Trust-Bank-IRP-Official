@@ -1,5 +1,7 @@
 import {
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   EmbedBuilder,
   MessageFlags,
   ModalBuilder,
@@ -1073,11 +1075,20 @@ export function parseDropdownOptions(rawInput) {
     : rawInput.split(/[,;]/);
 
   const options = [];
+  let extractedPlaceholder = null;
   let index = 1;
 
   for (const rawLine of lines) {
     const trimmed = rawLine.trim();
     if (!trimmed) continue;
+
+    // Optional first-line placeholder configuration (e.g. "Placeholder: Select service")
+    const placeholderMatch = trimmed.match(/^(?:placeholder|prompt)\s*[:=]\s*(.+)$/i);
+    if (placeholderMatch && !extractedPlaceholder && options.length === 0) {
+      extractedPlaceholder = placeholderMatch[1].trim().slice(0, 150);
+      continue;
+    }
+
     if (options.length >= 25) break; // Discord maximum options per select menu
 
     let label = trimmed;
@@ -1108,6 +1119,10 @@ export function parseDropdownOptions(rawInput) {
       description: description || undefined,
     });
     index++;
+  }
+
+  if (extractedPlaceholder) {
+    options.placeholder = extractedPlaceholder;
   }
 
   return options;
@@ -1159,6 +1174,7 @@ export const pendingEmbedModalConfigs = new Map();
 
 /**
  * Slash command definition for /server-embed with dropdown support.
+ * Debloated, streamlined options without redundant fields or channel selectors.
  */
 export const serverEmbedCommand = new SlashCommandBuilder()
   .setName("server-embed")
@@ -1174,6 +1190,18 @@ export const serverEmbedCommand = new SlashCommandBuilder()
       .setRequired(false)
       .setMaxLength(4096))
   .addStringOption((o) =>
+    o.setName("options")
+      .setDescription("Dropdown options (e.g. Option 1 | Details, Option 2 | Details)")
+      .setRequired(false)
+      .setMaxLength(2000))
+  .addStringOption((o) =>
+    o.setName("function")
+      .setDescription("Embed functionality (select 'dropdown' to configure interactive menu)")
+      .setRequired(false)
+      .addChoices(
+        { name: "dropdown", value: "dropdown" },
+      ))
+  .addStringOption((o) =>
     o.setName("color")
       .setDescription("Hex color, for example #5865F2")
       .setRequired(false)
@@ -1186,36 +1214,6 @@ export const serverEmbedCommand = new SlashCommandBuilder()
   .addStringOption((o) =>
     o.setName("footer")
       .setDescription("Footer text")
-      .setRequired(false)
-      .setMaxLength(2048))
-  .addStringOption((o) =>
-    o.setName("function")
-      .setDescription("Embed functionality (select 'dropdown' to attach a select menu)")
-      .setRequired(false)
-      .addChoices(
-        { name: "dropdown", value: "dropdown" },
-      ))
-  .addStringOption((o) =>
-    o.setName("dropdown_placeholder")
-      .setDescription("Placeholder text for the dropdown (e.g. Choose an option...)")
-      .setRequired(false)
-      .setMaxLength(150))
-  .addStringOption((o) =>
-    o.setName("dropdown_options")
-      .setDescription("Dropdown options (e.g. Option 1 | Details, Option 2 | Details)")
-      .setRequired(false)
-      .setMaxLength(2000))
-  .addChannelOption((o) =>
-    o.setName("channel")
-      .setDescription("Target channel to post in (defaults to current channel)"))
-  .addStringOption((o) =>
-    o.setName("thumbnail")
-      .setDescription("Thumbnail image URL (http/https)")
-      .setRequired(false)
-      .setMaxLength(500))
-  .addStringOption((o) =>
-    o.setName("image")
-      .setDescription("Large banner image URL (http/https)")
       .setRequired(false)
       .setMaxLength(2048))
   .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
@@ -1232,7 +1230,7 @@ export function createServerEmbedCommand() {
 /**
  * Handles `/server-embed` command execution.
  * Enforces administrator permissions, validates all inputs, and delivers the embed
- * with optional dropdown select menu (via modal setup or direct parameters).
+ * directly in the current channel with optional interactive dropdown menu.
  *
  * @param {import("discord.js").ChatInputCommandInteraction} interaction
  * @returns {Promise<void>}
@@ -1258,29 +1256,27 @@ export async function handleServerEmbedCommand(interaction) {
   const title = interaction.options.getString("title");
   const description = interaction.options.getString("description");
   const colorInput = interaction.options.getString("color");
-  const imageUrlInput = interaction.options.getString("image_url") || interaction.options.getString("image");
-  const thumbnailInput = interaction.options.getString?.("thumbnail");
+  const imageUrlInput = interaction.options.getString("image_url") || interaction.options.getString?.("image");
   const footerText = interaction.options.getString("footer");
   const functionChoice = interaction.options.getString?.("function");
-  const dropdownPlaceholder = interaction.options.getString?.("dropdown_placeholder");
-  const dropdownOptionsRaw = interaction.options.getString?.("dropdown_options");
-  const targetChannel = interaction.options.getChannel?.("channel");
+  // Accept debloated "options", and support "dropdown_options" for backwards compatibility
+  const optionsRaw = interaction.options.getString?.("options") || interaction.options.getString?.("dropdown_options");
 
+  // Differentiate dropdown functionality:
   // If function:dropdown selected without options provided, open modal so admin can fill out options
-  const wantsDropdownModal = (functionChoice === "dropdown" && !dropdownOptionsRaw);
+  const wantsDropdownModal = (functionChoice === "dropdown" && !optionsRaw);
   if (wantsDropdownModal && typeof interaction.showModal === "function" && !interaction.deferred && !interaction.replied) {
     try {
       if (colorInput) parseEmbedColor(colorInput);
       if (imageUrlInput) validateImageUrl(imageUrlInput);
-      if (thumbnailInput) validateImageUrl(thumbnailInput);
     } catch (err) {
       return interaction.reply({ content: `⚠️ ${err.message}`, flags: MessageFlags.Ephemeral });
     }
 
     const token = Math.random().toString(36).slice(2, 10);
     pendingEmbedModalConfigs.set(token, {
-      embedData: { title, description, color: colorInput, imageUrl: imageUrlInput, thumbnailUrl: thumbnailInput, footerText },
-      targetChannelId: targetChannel?.id || interaction.channelId,
+      embedData: { title, description, color: colorInput, imageUrl: imageUrlInput, footerText },
+      channelId: interaction.channelId || interaction.channel?.id,
       createdAt: Date.now(),
       adminId: interaction.user?.id,
     });
@@ -1293,8 +1289,8 @@ export async function handleServerEmbedCommand(interaction) {
       .setCustomId("placeholder")
       .setLabel("Dropdown Placeholder")
       .setStyle(TextInputStyle.Short)
-      .setPlaceholder(dropdownPlaceholder || "Select an option...")
-      .setValue(dropdownPlaceholder || "Select an option...")
+      .setPlaceholder("Select an option...")
+      .setValue("Select an option...")
       .setRequired(false)
       .setMaxLength(150);
 
@@ -1323,11 +1319,9 @@ export async function handleServerEmbedCommand(interaction) {
   // 2. Parse and validate inputs with user-friendly error messages
   let color;
   let imageUrl = null;
-  let thumbnailUrl = null;
   try {
     color = parseEmbedColor(colorInput);
     imageUrl = validateImageUrl(imageUrlInput);
-    if (thumbnailInput) thumbnailUrl = validateImageUrl(thumbnailInput);
   } catch (err) {
     const errorMsg = `⚠️ ${err.message}`;
     if (interaction.deferred || interaction.replied) {
@@ -1343,40 +1337,23 @@ export async function handleServerEmbedCommand(interaction) {
 
   if (description) embed.setDescription(description);
   if (imageUrl) embed.setImage(imageUrl);
-  if (thumbnailUrl) embed.setThumbnail(thumbnailUrl);
   if (footerText) embed.setFooter({ text: footerText });
 
   // 4. Build dropdown component if options are provided or function is dropdown
   let components = [];
-  if (dropdownOptionsRaw) {
-    const parsedOptions = parseDropdownOptions(dropdownOptionsRaw);
+  if (optionsRaw) {
+    const parsedOptions = parseDropdownOptions(optionsRaw);
     if (parsedOptions.length > 0) {
+      const placeholder = parsedOptions.placeholder || "Select an option...";
       const row = buildDropdownComponent({
-        placeholder: dropdownPlaceholder || "Select an option...",
+        placeholder,
         options: parsedOptions,
       });
       if (row) components.push(row);
     }
   }
 
-  // 5. Send the embed
-  if (targetChannel && typeof targetChannel.send === "function" && targetChannel.id !== interaction.channel?.id) {
-    try {
-      await targetChannel.send({ embeds: [embed], components });
-      const confirmation = `Embed successfully posted in <#${targetChannel.id}>.`;
-      if (interaction.deferred || interaction.replied) {
-        return interaction.editReply({ content: confirmation });
-      }
-      return interaction.reply({ content: confirmation, flags: MessageFlags.Ephemeral });
-    } catch (sendError) {
-      const failMsg = `Failed to deliver embed: ${sendError?.message || "Unknown Discord API error"}`;
-      if (interaction.deferred || interaction.replied) {
-        return interaction.editReply({ content: failMsg });
-      }
-      return interaction.reply({ content: failMsg, flags: MessageFlags.Ephemeral });
-    }
-  }
-
+  // 5. Send the embed directly in the current channel (no channel parameter)
   if (interaction.channel && typeof interaction.channel.send === "function" && !interaction.deferred && !interaction.replied) {
     try {
       await interaction.channel.send({ embeds: [embed], components });
@@ -1429,30 +1406,20 @@ export async function handleServerEmbedModalSubmit(interaction) {
     return interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
   }
 
-  const { title, description, color, imageUrl, thumbnailUrl, footerText } = pending.embedData;
+  const { title, description, color, imageUrl, footerText } = pending.embedData;
   const parsedColor = parseEmbedColor(color);
   const embed = new EmbedBuilder().setTitle(title).setColor(parsedColor);
   if (description) embed.setDescription(description);
   if (imageUrl) embed.setImage(imageUrl);
-  if (thumbnailUrl) embed.setThumbnail(thumbnailUrl);
   if (footerText) embed.setFooter({ text: footerText });
 
   const row = buildDropdownComponent({
-    placeholder,
+    placeholder: parsedOptions.placeholder || placeholder,
     options: parsedOptions,
   });
   const components = row ? [row] : [];
 
-  let targetChannel = null;
-  if (interaction.client?.channels && pending.targetChannelId) {
-    try {
-      targetChannel = await interaction.client.channels.fetch(pending.targetChannelId);
-    } catch {
-      targetChannel = interaction.channel;
-    }
-  } else {
-    targetChannel = interaction.channel;
-  }
+  const targetChannel = interaction.channel;
 
   try {
     if (targetChannel && typeof targetChannel.send === "function") {
@@ -1482,21 +1449,66 @@ export async function handleServerEmbedModalSubmit(interaction) {
 
 /**
  * Handles interactions when a user selects an item from a server-embed dropdown.
+ * Differentiates option functionality (links, banking actions, guidance) to make
+ * dropdown options genuinely actionable.
  *
  * @param {import("discord.js").StringSelectMenuInteraction} interaction
  * @returns {Promise<void>}
  */
 export async function handleServerEmbedDropdownSelect(interaction) {
-  const selectedValue = interaction.values?.[0];
+  const selectedValue = interaction.values?.[0] || "";
   const selectedOption = interaction.component?.options?.find((opt) => opt.value === selectedValue);
   const label = selectedOption?.label || selectedValue || "Unknown option";
   const desc = selectedOption?.description ? `\n> ${selectedOption.description}` : "";
 
-  const responseContent = `You selected **${label}**${desc}`;
-  if (interaction.deferred || interaction.replied) {
-    return interaction.editReply({ content: responseContent });
+  // Differentiate functionality based on option content
+  const combined = `${label} ${selectedOption?.description || ""} ${selectedValue}`.toLowerCase();
+
+  let actionAdvice = "";
+  const components = [];
+
+  // Check for link / URL
+  const urlMatch = (selectedOption?.description || "").match(/https?:\/\/[^\s]+/i) ||
+                   (label).match(/https?:\/\/[^\s]+/i);
+  if (urlMatch) {
+    const url = urlMatch[0];
+    actionAdvice = `\n\n🔗 **Link:** [Click here to open](${url})`;
+    try {
+      const button = new ButtonBuilder()
+        .setLabel(`Open ${label.replace(/https?:\/\/[^\s]+/i, "").trim() || "Link"}`)
+        .setStyle(ButtonStyle.Link)
+        .setURL(url);
+      components.push(new ActionRowBuilder().addComponents(button));
+    } catch {
+      // Fall through to text link
+    }
+  } else if (/\b(deposit|receipt)\b/i.test(combined)) {
+    actionAdvice = "\n\n💡 **Action:** Run `/deposit` with your amount to open a private deposit ticket and submit your receipt.";
+  } else if (/\b(withdraw|withdrawal)\b/i.test(combined)) {
+    actionAdvice = "\n\n💡 **Action:** Run `/withdraw` with your amount to request a private withdrawal.";
+  } else if (/\b(balance|funds|ledger)\b/i.test(combined)) {
+    actionAdvice = "\n\n💡 **Action:** Run `/balance` to view your private ledger balance.";
+  } else if (/\b(transfer|send money)\b/i.test(combined)) {
+    actionAdvice = "\n\n💡 **Action:** Run `/transfer` to send funds to another registered citizen.";
+  } else if (/\b(register|bloxlink|verify)\b/i.test(combined)) {
+    actionAdvice = "\n\n💡 **Action:** Run `/register` to link your Roblox account with Bloxlink.";
+  } else if (/\b(ticket|support|help|staff)\b/i.test(combined)) {
+    actionAdvice = "\n\n💡 **Action:** Use `/deposit` or `/withdraw` to open a private ticket with bank staff.";
   }
-  return interaction.reply({ content: responseContent, flags: MessageFlags.Ephemeral });
+
+  const responseContent = `You selected **${label}**${desc}${actionAdvice}`;
+  const responsePayload = {
+    content: responseContent,
+    flags: MessageFlags.Ephemeral,
+  };
+  if (components.length > 0) {
+    responsePayload.components = components;
+  }
+
+  if (interaction.deferred || interaction.replied) {
+    return interaction.editReply(responsePayload);
+  }
+  return interaction.reply(responsePayload);
 }
 
 export default {

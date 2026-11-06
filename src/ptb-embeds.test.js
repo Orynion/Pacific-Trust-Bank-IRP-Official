@@ -435,11 +435,14 @@ test("createServerEmbedCommand configures administrator permissions and options"
   const optionNames = json.options.map((o) => o.name);
   assert.ok(optionNames.includes("title"));
   assert.ok(optionNames.includes("description"));
+  assert.ok(optionNames.includes("options"));
+  assert.ok(optionNames.includes("function"));
   assert.ok(optionNames.includes("color"));
-  assert.ok(optionNames.includes("channel"));
-  assert.ok(optionNames.includes("thumbnail"));
-  assert.ok(optionNames.includes("image"));
+  assert.ok(optionNames.includes("image_url"));
   assert.ok(optionNames.includes("footer"));
+  assert.equal(optionNames.includes("channel"), false, "channel is removed from server-embed");
+  assert.equal(optionNames.includes("thumbnail"), false, "thumbnail is removed from server-embed");
+  assert.equal(optionNames.includes("image"), false, "duplicate image option is removed from server-embed");
 });
 
 test("handleServerEmbedCommand enforces administrator permission and sends embed", async () => {
@@ -614,6 +617,11 @@ test("serverEmbedCommand and handleServerEmbedCommand support image_url, color v
   assert.ok(optionNames.includes("color"));
   assert.ok(optionNames.includes("image_url"));
   assert.ok(optionNames.includes("footer"));
+  assert.ok(optionNames.includes("options"), "options must exist in debloated command");
+  assert.equal(optionNames.includes("channel"), false, "channel must be removed from command");
+  assert.equal(optionNames.includes("thumbnail"), false, "thumbnail must be removed from command");
+  assert.equal(optionNames.includes("dropdown_options"), false, "dropdown_options renamed to options");
+  assert.equal(optionNames.includes("dropdown_placeholder"), false, "dropdown_placeholder removed from command");
 
   let editReplyPayload = null;
   let replyPayload = null;
@@ -785,7 +793,7 @@ test("handleServerEmbedCommand displays modal when function:dropdown is selected
   assert.equal(pending.adminId, "admin-user-123");
 });
 
-test("handleServerEmbedCommand creates embed and dropdown directly when dropdown_options are provided", async () => {
+test("handleServerEmbedCommand creates embed and dropdown directly when options are provided", async () => {
   let replyPayload = null;
   const interaction = {
     member: {
@@ -801,9 +809,8 @@ test("handleServerEmbedCommand creates embed and dropdown directly when dropdown
     options: {
       getString: (name) => {
         if (name === "title") return "Quick Navigation";
-        if (name === "function") return "dropdown";
-        if (name === "dropdown_placeholder") return "Go to section...";
-        if (name === "dropdown_options") return "Lobby | Return to main\nBanking | Open bank guide\nSupport | Create ticket";
+        // Notice: function: dropdown is NOT set, options alone reaches the dropdown functionality!
+        if (name === "options") return "Placeholder: Go to section...\nLobby | Return to main\nBanking | Open bank guide\nSupport | Create ticket";
         return null;
       },
       getChannel: () => null,
@@ -835,10 +842,8 @@ test("handleServerEmbedModalSubmit processes submitted dropdown options and post
       description: "Select an inquiry topic below.",
       color: "#0B3D2E",
       imageUrl: null,
-      thumbnailUrl: null,
       footerText: "PTB Information Desk",
     },
-    targetChannelId: "test-channel",
     adminId: "admin-456",
     createdAt: Date.now(),
   });
@@ -890,28 +895,76 @@ test("handleServerEmbedModalSubmit processes submitted dropdown options and post
   assert.match(expiredReply.content, /session has expired or was not found/);
 });
 
-test("handleServerEmbedDropdownSelect responds ephemerally with selected option details", async () => {
-  let selectReply = null;
-  const interaction = {
-    values: ["open_account"],
+test("handleServerEmbedDropdownSelect differentiates options and reaches appropriate functionality", async () => {
+  // Test 1: Banking guidance differentiation (Deposit Help)
+  let depositReply = null;
+  const depositInteraction = {
+    values: ["opt_2_deposit_help"],
     component: {
       options: [
-        { label: "Open Account", value: "open_account", description: "Register for ledger" },
-        { label: "Deposit Help", value: "deposit_help", description: "Receipt guidance" },
+        { label: "Deposit Help", value: "opt_2_deposit_help", description: "How to deposit cash" },
       ],
     },
     deferred: false,
     replied: false,
     reply: async (payload) => {
-      selectReply = payload;
+      depositReply = payload;
     },
   };
 
-  await handleServerEmbedDropdownSelect(interaction);
+  await handleServerEmbedDropdownSelect(depositInteraction);
+  assert.ok(depositReply);
+  assert.match(depositReply.content, /You selected \*\*Deposit Help\*\*/);
+  assert.match(depositReply.content, /> How to deposit cash/);
+  assert.match(depositReply.content, /Run `\/deposit` with your amount/);
 
-  assert.ok(selectReply);
-  assert.match(selectReply.content, /You selected \*\*Open Account\*\*/);
-  assert.match(selectReply.content, /> Register for ledger/);
+  // Test 2: Link differentiation with Action Button (Website portal)
+  let linkReply = null;
+  const linkInteraction = {
+    values: ["opt_1_official_portal"],
+    component: {
+      options: [
+        { label: "Official Portal", value: "opt_1_official_portal", description: "Visit https://ptb.example.com" },
+      ],
+    },
+    deferred: false,
+    replied: false,
+    reply: async (payload) => {
+      linkReply = payload;
+    },
+  };
+
+  await handleServerEmbedDropdownSelect(linkInteraction);
+  assert.ok(linkReply);
+  assert.match(linkReply.content, /You selected \*\*Official Portal\*\*/);
+  assert.match(linkReply.content, /\[Click here to open\]\(https:\/\/ptb\.example\.com\)/);
+  assert.ok(linkReply.components?.length === 1, "Should attach Link Button component");
+  const linkButton = linkReply.components[0].toJSON().components[0];
+  assert.equal(linkButton.type, 2); // Button
+  assert.equal(linkButton.style, 5); // Link style
+  assert.equal(linkButton.url, "https://ptb.example.com");
+
+  // Test 3: General informative selection
+  let generalReply = null;
+  const generalInteraction = {
+    values: ["opt_3_lore"],
+    component: {
+      options: [
+        { label: "PTB History", value: "opt_3_lore", description: "Founded in Hamburg in 1982" },
+      ],
+    },
+    deferred: false,
+    replied: false,
+    reply: async (payload) => {
+      generalReply = payload;
+    },
+  };
+
+  await handleServerEmbedDropdownSelect(generalInteraction);
+  assert.ok(generalReply);
+  assert.match(generalReply.content, /You selected \*\*PTB History\*\*/);
+  assert.match(generalReply.content, /> Founded in Hamburg in 1982/);
+  assert.equal(generalReply.components, undefined);
 });
 
 
