@@ -1,5 +1,8 @@
 import { ChannelType, PermissionFlagsBits } from "discord.js";
 
+/** Default support staff role ID with ticket access permissions */
+export const DEFAULT_SUPPORT_STAFF_ROLE_ID = "1566831947328520233";
+
 /** Parse a comma-separated list of Discord snowflakes. */
 export function parseIdList(value) {
   return [...new Set(String(value ?? "")
@@ -12,9 +15,14 @@ export function parseIdList(value) {
 export function ticketConfig(env = process.env) {
   const categoryId = String(env.TICKET_CATEGORY_ID ?? "").trim();
   const logChannelId = String(env.TICKET_LOG_CHANNEL_ID ?? "").trim();
+  const rawStaff = env.TICKET_STAFF_ROLE_IDS ?? env.SUPPORT_STAFF_ROLE_ID ?? env.SUPPORT_STAFF_ROLE_IDS;
+  const staffRoleIds = (rawStaff !== undefined && rawStaff !== null && String(rawStaff).trim() !== "")
+    ? parseIdList(rawStaff)
+    : [DEFAULT_SUPPORT_STAFF_ROLE_ID];
+
   return {
     categoryId: /^[A-Za-z0-9_-]{1,32}$/.test(categoryId) ? categoryId : null,
-    staffRoleIds: parseIdList(env.TICKET_STAFF_ROLE_IDS),
+    staffRoleIds,
     logChannelId: /^[A-Za-z0-9_-]{1,32}$/.test(logChannelId) ? logChannelId : null,
   };
 }
@@ -33,6 +41,7 @@ function memberHasRole(interaction, roleIds) {
  */
 export function isTicketStaff(interaction, roleIds = ticketConfig().staffRoleIds) {
   if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return true;
+  if (memberHasRole(interaction, [DEFAULT_SUPPORT_STAFF_ROLE_ID])) return true;
   return memberHasRole(interaction, roleIds);
 }
 

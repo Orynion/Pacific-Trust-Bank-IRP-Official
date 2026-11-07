@@ -28,16 +28,22 @@ import {
   handleServerEmbedCommand,
   parseEmbedColor,
   validateImageUrl,
+  resolveWebsiteThumbnail,
   sanitizeEmbed,
   addSafeChunkedFields,
+  parseSingleOption,
   parseDropdownOptions,
   buildDropdownComponent,
+  buildTicketButtonsComponent,
+  dropdownCustomResponses,
+  saveDropdownOptionResponses,
   pendingEmbedModalConfigs,
   serverEmbedCommand,
   handleServerEmbedModalSubmit,
   handleServerEmbedOptionCountClick,
   handleServerEmbedDynamicModalSubmit,
   handleServerEmbedDropdownSelect,
+  handleServerEmbedTicketOpenClick,
 } from "./ptb-embeds.js";
 
 test("PTB color palette and footers are consistent and frozen", () => {
@@ -439,11 +445,12 @@ test("createServerEmbedCommand configures administrator permissions and options"
   assert.ok(optionNames.includes("description"));
   assert.ok(optionNames.includes("function"));
   assert.ok(optionNames.includes("color"));
+  assert.ok(optionNames.includes("image_file"), "image_file direct attachment option is supported");
   assert.ok(optionNames.includes("image_url"));
+  assert.ok(optionNames.includes("thumbnail"), "thumbnail option is supported");
   assert.ok(optionNames.includes("footer"));
   assert.equal(optionNames.includes("options"), false, "options input removed from slash command");
   assert.equal(optionNames.includes("channel"), false, "channel is removed from server-embed");
-  assert.equal(optionNames.includes("thumbnail"), false, "thumbnail is removed from server-embed");
   assert.equal(optionNames.includes("image"), false, "duplicate image option is removed from server-embed");
 });
 
@@ -618,11 +625,12 @@ test("serverEmbedCommand and handleServerEmbedCommand support image_url, color v
   assert.ok(optionNames.includes("description"));
   assert.ok(optionNames.includes("function"));
   assert.ok(optionNames.includes("color"));
+  assert.ok(optionNames.includes("image_file"));
   assert.ok(optionNames.includes("image_url"));
+  assert.ok(optionNames.includes("thumbnail"));
   assert.ok(optionNames.includes("footer"));
   assert.equal(optionNames.includes("options"), false, "options input removed from slash command");
   assert.equal(optionNames.includes("channel"), false, "channel must be removed from command");
-  assert.equal(optionNames.includes("thumbnail"), false, "thumbnail must be removed from command");
   assert.equal(optionNames.includes("dropdown_options"), false, "dropdown_options removed");
   assert.equal(optionNames.includes("dropdown_placeholder"), false, "dropdown_placeholder removed from command");
 
@@ -1020,5 +1028,592 @@ test("handleServerEmbedDropdownSelect differentiates options and reaches appropr
   assert.match(generalReply.content, /-# Pacific Trust Bank • Interactive Menu/);
   assert.equal(generalReply.components, undefined);
 });
+
+test("resolveWebsiteThumbnail resolves direct images, Discord CDN urls, and falls back for website domains", async () => {
+  // Direct image URLs
+  assert.equal(await resolveWebsiteThumbnail("https://example.com/banner.png"), "https://example.com/banner.png");
+  assert.equal(await resolveWebsiteThumbnail("https://example.com/avatar.jpg?v=2"), "https://example.com/avatar.jpg?v=2");
+  assert.equal(await resolveWebsiteThumbnail("https://example.com/anim.gif"), "https://example.com/anim.gif");
+  assert.equal(await resolveWebsiteThumbnail("https://example.com/icon.webp"), "https://example.com/icon.webp");
+
+  // Discord CDN attachments return directly
+  const cdnUrl = "https://cdn.discordapp.com/attachments/12345/67890/receipt.png";
+  assert.equal(await resolveWebsiteThumbnail(cdnUrl), cdnUrl);
+
+  // Invalid inputs return null
+  assert.equal(await resolveWebsiteThumbnail(null), null);
+  assert.equal(await resolveWebsiteThumbnail(""), null);
+  assert.equal(await resolveWebsiteThumbnail("ftp://example.com/image.png"), null);
+  assert.equal(await resolveWebsiteThumbnail("not-a-valid-url"), null);
+
+  // Website homepage URL (fallback returns high-res favicon service)
+  const websiteResult = await resolveWebsiteThumbnail("https://example.com", 500);
+  assert.ok(websiteResult);
+  assert.ok(websiteResult.startsWith("http://") || websiteResult.startsWith("https://"));
+});
+
+test("handleServerEmbedCommand supports direct file upload (image_file) and passes files payload", async () => {
+  let sentPayload = null;
+  let replyPayload = null;
+
+  const mockChannel = {
+    id: "announcements-ch",
+    send: async (payload) => {
+      sentPayload = payload;
+      return payload;
+    },
+  };
+
+  const fileInteraction = {
+    member: {
+      permissions: { has: () => true },
+    },
+    memberPermissions: {
+      has: () => true,
+    },
+    deferred: false,
+    replied: false,
+    channel: mockChannel,
+    options: {
+      getString: (name) => {
+        if (name === "title") return "Direct Image File Upload";
+        if (name === "description") return "Testing direct Discord file attachment.";
+        if (name === "color") return "#0B3D2E";
+        return null;
+      },
+      getAttachment: (name) => {
+        if (name === "image_file") {
+          return {
+            url: "https://cdn.discordapp.com/attachments/999/888/uploaded_graphic.png",
+            name: "uploaded_graphic.png",
+          };
+        }
+        return null;
+      },
+    },
+    reply: async (msg) => { replyPayload = msg; },
+  };
+
+  await handleServerEmbedCommand(fileInteraction);
+
+  assert.ok(sentPayload);
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /Embed successfully posted/);
+
+  // Check embed image
+  const embedData = sentPayload.embeds[0].data;
+  assert.equal(embedData.title, "Direct Image File Upload");
+  assert.equal(embedData.image.url, "https://cdn.discordapp.com/attachments/999/888/uploaded_graphic.png");
+
+  // Check files payload
+  assert.ok(Array.isArray(sentPayload.files));
+  assert.equal(sentPayload.files.length, 1);
+  assert.equal(sentPayload.files[0].attachment, "https://cdn.discordapp.com/attachments/999/888/uploaded_graphic.png");
+  assert.equal(sentPayload.files[0].name, "uploaded_graphic.png");
+});
+
+test("handleServerEmbedCommand supports thumbnail and resolves website homepage thumbnail", async () => {
+  let sentPayload = null;
+  let replyPayload = null;
+
+  const mockChannel = {
+    id: "rules-ch",
+    send: async (payload) => {
+      sentPayload = payload;
+      return payload;
+    },
+  };
+
+  const thumbnailInteraction = {
+    member: {
+      permissions: { has: () => true },
+    },
+    memberPermissions: {
+      has: () => true,
+    },
+    deferred: false,
+    replied: false,
+    channel: mockChannel,
+    options: {
+      getString: (name) => {
+        if (name === "title") return "Website Thumbnail Test";
+        if (name === "description") return "Checking thumbnail resolution.";
+        if (name === "thumbnail") return "https://example.com/logo.png";
+        return null;
+      },
+      getAttachment: () => null,
+    },
+    reply: async (msg) => { replyPayload = msg; },
+  };
+
+  await handleServerEmbedCommand(thumbnailInteraction);
+
+  assert.ok(sentPayload);
+  const embedData = sentPayload.embeds[0].data;
+  assert.equal(embedData.title, "Website Thumbnail Test");
+  assert.equal(embedData.thumbnail.url, "https://example.com/logo.png");
+});
+
+test("dynamic dropdown flow preserves uploaded image_file and thumbnail through modal submit", async () => {
+  let modalPromptReply = null;
+  const token = "flow-test-token";
+
+  const startInteraction = {
+    member: { permissions: { has: () => true } },
+    memberPermissions: { has: () => true },
+    user: { id: "admin-777" },
+    channelId: "channel-dropdown-test",
+    deferred: false,
+    replied: false,
+    options: {
+      getString: (name) => {
+        if (name === "title") return "Interactive Menu with Uploaded File";
+        if (name === "description") return "Choose your preferred branch.";
+        if (name === "function") return "dropdown";
+        if (name === "thumbnail") return "https://example.com/bank-icon.png";
+        return null;
+      },
+      getAttachment: (name) => {
+        if (name === "image_file") {
+          return {
+            url: "https://cdn.discordapp.com/attachments/111/222/chart.png",
+            name: "chart.png",
+          };
+        }
+        return null;
+      },
+    },
+    reply: async (payload) => { modalPromptReply = payload; },
+  };
+
+  await handleServerEmbedCommand(startInteraction);
+  assert.ok(modalPromptReply);
+  assert.match(modalPromptReply.content, /# Configure Dropdown Menu/);
+
+  // Extract session token
+  const buttonCustomId = modalPromptReply.components[0].toJSON().components[1].custom_id; // "2 Options"
+  const createdToken = buttonCustomId.split(":")[1];
+  assert.ok(pendingEmbedModalConfigs.has(createdToken));
+
+  const session = pendingEmbedModalConfigs.get(createdToken);
+  assert.equal(session.embedData.imageUrl, "https://cdn.discordapp.com/attachments/111/222/chart.png");
+  assert.equal(session.embedData.thumbnailUrl, "https://example.com/bank-icon.png");
+  assert.ok(session.embedData.imageAttachment);
+  assert.equal(session.embedData.imageAttachment.name, "chart.png");
+
+  // Submit dynamic modal
+  let sentToChannel = null;
+  let dynamicSubmitReply = null;
+  const mockChannel = {
+    id: "channel-dropdown-test",
+    send: async (msg) => {
+      sentToChannel = msg;
+      return msg;
+    },
+  };
+
+  const dynamicSubmitInteraction = {
+    customId: `server-embed-dynamic-modal:${createdToken}:2`,
+    deferred: true,
+    replied: false,
+    channel: mockChannel,
+    fields: {
+      getTextInputValue: (id) => {
+        if (id === "placeholder") return "Select a branch...";
+        if (id === "opt_1") return "North Branch | High Street";
+        if (id === "opt_2") return "South Branch | Harbor Road";
+        return "";
+      },
+    },
+    editReply: async (msg) => { dynamicSubmitReply = msg; },
+  };
+
+  await handleServerEmbedDynamicModalSubmit(dynamicSubmitInteraction);
+
+  assert.ok(sentToChannel);
+  assert.match(dynamicSubmitReply.content, /# Dropdown Embed Published/);
+
+  const finalEmbed = sentToChannel.embeds[0].data;
+  assert.equal(finalEmbed.title, "Interactive Menu with Uploaded File");
+  assert.equal(finalEmbed.image.url, "https://cdn.discordapp.com/attachments/111/222/chart.png");
+  assert.equal(finalEmbed.thumbnail.url, "https://example.com/bank-icon.png");
+
+  // Check files payload was passed to channel.send
+  assert.ok(Array.isArray(sentToChannel.files));
+  assert.equal(sentToChannel.files.length, 1);
+  assert.equal(sentToChannel.files[0].attachment, "https://cdn.discordapp.com/attachments/111/222/chart.png");
+  assert.equal(sentToChannel.files[0].name, "chart.png");
+});
+
+test("serverEmbedCommand has function choices for dropdown and ticket", () => {
+  const json = serverEmbedCommand.toJSON();
+  const functionOpt = json.options.find((opt) => opt.name === "function");
+  assert.ok(functionOpt);
+  const choiceValues = functionOpt.choices.map((c) => c.value);
+  assert.ok(choiceValues.includes("dropdown"));
+  assert.ok(choiceValues.includes("ticket"));
+});
+
+test("buildTicketButtonsComponent creates buttons with custom IDs, styles, and splits rows by 5", () => {
+  const options = [
+    { label: "💵 Deposit Ticket", description: "Deposit funds into your account", emoji: "💵" },
+    { label: "💳 Withdrawal Support", description: "Request account payout", emoji: "💳" },
+    { label: "⚠️ Fraud Report", description: "Report account suspicious activity", emoji: "⚠️" },
+    { label: "General Assistance", description: "Questions and assistance" },
+    { label: "VIP Banking", description: "Private banking clients" },
+    { label: "Loan Request", description: "Apply for roleplay mortgage" },
+  ];
+
+  const rows = buildTicketButtonsComponent(options);
+  assert.equal(rows.length, 2); // 5 in first row, 1 in second row
+
+  const row1 = rows[0].toJSON();
+  assert.equal(row1.components.length, 5);
+  // Button 1: Deposit (Success style)
+  assert.equal(row1.components[0].label, "💵 Deposit Ticket");
+  assert.equal(row1.components[0].style, 3); // Success
+  assert.match(row1.components[0].custom_id, /^server-embed-ticket-open:deposit-ticket:/);
+
+  // Button 3: Fraud (Danger style)
+  assert.equal(row1.components[2].label, "⚠️ Fraud Report");
+  assert.equal(row1.components[2].style, 4); // Danger
+
+  // Button 4: General Assistance
+  assert.equal(row1.components[3].label, "General Assistance");
+  assert.equal(row1.components[3].style, 1); // Primary
+
+  const row2 = rows[1].toJSON();
+  assert.equal(row2.components.length, 1);
+  assert.equal(row2.components[0].label, "Loan Request");
+});
+
+test("/server-embed function:ticket prompts for button count and builds dynamic modal with button fields", async () => {
+  let promptReply = null;
+  const commandInteraction = {
+    member: { permissions: { has: () => true } },
+    options: {
+      getString: (name) => {
+        if (name === "title") return "PTB Support Desk";
+        if (name === "description") return "Click a button below to open a ticket.";
+        if (name === "function") return "ticket";
+        return null;
+      },
+      getAttachment: () => null,
+    },
+    reply: async (payload) => { promptReply = payload; },
+  };
+
+  await handleServerEmbedCommand(commandInteraction);
+  assert.ok(promptReply);
+  assert.match(promptReply.content, /# Configure Ticket Buttons/);
+
+  // Check 1 to 5 options buttons
+  const countRow = promptReply.components[0].toJSON();
+  assert.equal(countRow.components.length, 5);
+  const token = countRow.components[2].custom_id.split(":")[1]; // 3 options
+  assert.ok(pendingEmbedModalConfigs.has(token));
+  assert.equal(pendingEmbedModalConfigs.get(token).mode, "ticket");
+
+  // Click 3 options count button
+  let shownModal = null;
+  const countClickInteraction = {
+    customId: `embed-opts-count:${token}:3`,
+    user: { id: "admin-456" },
+    showModal: async (m) => { shownModal = m; },
+  };
+
+  await handleServerEmbedOptionCountClick(countClickInteraction);
+  assert.ok(shownModal);
+  const modalJson = shownModal.toJSON();
+  assert.match(modalJson.title, /Configure 3 Ticket Buttons/);
+  // In ticket mode, count <= 4 should NOT include placeholder input
+  assert.equal(modalJson.components.length, 3);
+  assert.equal(modalJson.components[0].components[0].custom_id, "opt_1");
+  assert.match(modalJson.components[0].components[0].label, /Button 1/);
+  assert.equal(modalJson.components[1].components[0].custom_id, "opt_2");
+  assert.equal(modalJson.components[2].components[0].custom_id, "opt_3");
+
+  // Submit dynamic modal
+  let channelMessage = null;
+  let dynamicSubmitReply = null;
+  const mockChannel = {
+    id: "channel-support-hub",
+    send: async (msg) => {
+      channelMessage = msg;
+      return msg;
+    },
+  };
+
+  const modalSubmitInteraction = {
+    customId: `server-embed-dynamic-modal:${token}:3`,
+    deferred: true,
+    replied: false,
+    channel: mockChannel,
+    fields: {
+      getTextInputValue: (id) => {
+        if (id === "opt_1") return "Deposit Help | Questions about receipts | 💵";
+        if (id === "opt_2") return "Withdrawal Help | Questions about payouts | 💳";
+        if (id === "opt_3") return "General Support | Account queries";
+        return "";
+      },
+    },
+    editReply: async (msg) => { dynamicSubmitReply = msg; },
+  };
+
+  await handleServerEmbedDynamicModalSubmit(modalSubmitInteraction);
+
+  assert.ok(channelMessage);
+  assert.match(dynamicSubmitReply.content, /# Ticket Embed Published/);
+  assert.equal(channelMessage.embeds[0].data.title, "PTB Support Desk");
+  assert.equal(channelMessage.components.length, 1);
+
+  const row = channelMessage.components[0].toJSON();
+  assert.equal(row.components.length, 3);
+  assert.equal(row.components[0].label, "Deposit Help");
+  assert.match(row.components[0].custom_id, /^server-embed-ticket-open:deposit-help:/);
+  assert.equal(row.components[1].label, "Withdrawal Help");
+  assert.equal(row.components[2].label, "General Support");
+});
+
+test("handleServerEmbedTicketOpenClick opens private ticket channel with custom name, welcome embed, and prevents duplicate tickets", async () => {
+  // Mock in-memory DB
+  const ticketsTable = [];
+  let insertId = 100;
+  const mockDb = {
+    transaction: async () => ({
+      execute: async ({ sql, args }) => {
+        if (sql.includes("INSERT INTO tickets")) {
+          insertId++;
+          ticketsTable.push({ id: insertId, kind: args[0], requester_id: args[1], amount: args[2], status: "pending" });
+          return { lastInsertRowid: insertId };
+        }
+        return { rows: [] };
+      },
+      commit: async () => {},
+      rollback: async () => {},
+      close: () => {},
+    }),
+    execute: async ({ sql, args }) => {
+      if (sql.includes("UPDATE tickets SET channel_id")) {
+        const ticket = ticketsTable.find((t) => t.id === args[1]);
+        if (ticket) ticket.channel_id = args[0];
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+  };
+
+  let createdChannelOptions = null;
+  let sentInTicketChannel = null;
+  const mockCreatedChannel = {
+    id: "channel-custom-ticket-101",
+    type: 0,
+    topic: "ptb-ticket:deposit-support:user-789:0:101",
+    send: async (msg) => {
+      sentInTicketChannel = msg;
+      return msg;
+    },
+    delete: async () => {},
+  };
+
+  let ephemeralReplyContent = null;
+  const mockGuildChannels = [];
+  const mockGuild = {
+    id: "guild-123",
+    roles: {
+      everyone: { id: "guild-123" },
+      cache: new Map(),
+    },
+    channels: {
+      fetch: async () => mockGuildChannels,
+      create: async (opts) => {
+        createdChannelOptions = opts;
+        mockGuildChannels.push(mockCreatedChannel);
+        return mockCreatedChannel;
+      },
+    },
+  };
+
+  const buttonInteraction = {
+    customId: "server-embed-ticket-open:deposit-support:Deposit%20Support",
+    guild: mockGuild,
+    user: { id: "user-789", username: "AliceTrader" },
+    client: { user: { id: "bot-999" } },
+    deferred: false,
+    replied: false,
+    deferReply: async () => { buttonInteraction.deferred = true; },
+    editReply: async (msg) => { ephemeralReplyContent = msg.content; },
+    reply: async (msg) => { ephemeralReplyContent = msg.content; },
+  };
+
+  // 1. Open the ticket
+  await handleServerEmbedTicketOpenClick(mockDb, buttonInteraction);
+
+  assert.ok(createdChannelOptions);
+  // Channel name contains the custom ticket option name
+  assert.match(createdChannelOptions.name, /^deposit-support-101-alicetrader$/);
+  assert.equal(createdChannelOptions.topic, "ptb-ticket:deposit-support:user-789:0:101");
+
+  // Welcome panel was sent to the channel
+  assert.ok(sentInTicketChannel);
+  assert.match(sentInTicketChannel.content, /Deposit Support/);
+  const welcomeEmbed = sentInTicketChannel.embeds[0].data;
+  assert.match(welcomeEmbed.title, /🎫 Deposit Support · PTB-T-101/);
+  // Has close button
+  assert.equal(sentInTicketChannel.components.length, 1);
+  const closeButton = sentInTicketChannel.components[0].toJSON().components[0];
+  assert.equal(closeButton.label, "Close ticket");
+  assert.equal(closeButton.custom_id, "ticket-close:channel-custom-ticket-101:101");
+
+  // User received ephemeral confirmation with channel link and code
+  assert.match(ephemeralReplyContent, /# Ticket Created/);
+  assert.match(ephemeralReplyContent, /<#channel-custom-ticket-101>/);
+  assert.match(ephemeralReplyContent, /PTB-T-101/);
+
+  // 2. Try opening another ticket of the same kind - should be prevented as duplicate!
+  let duplicateReplyContent = null;
+  const duplicateInteraction = {
+    customId: "server-embed-ticket-open:deposit-support:Deposit%20Support",
+    guild: mockGuild,
+    user: { id: "user-789", username: "AliceTrader" },
+    client: { user: { id: "bot-999" } },
+    deferred: false,
+    replied: false,
+    deferReply: async () => { duplicateInteraction.deferred = true; },
+    editReply: async (msg) => { duplicateReplyContent = msg.content; },
+    reply: async (msg) => { duplicateReplyContent = msg.content; },
+  };
+
+  await handleServerEmbedTicketOpenClick(mockDb, duplicateInteraction);
+  assert.match(duplicateReplyContent, /# Ticket Already Open/);
+  assert.match(duplicateReplyContent, /<#channel-custom-ticket-101>/);
+});
+
+test("parseSingleOption and parseDropdownOptions extract custom reply messages from 3-part pipes, reply: prefix, and newlines", () => {
+  // 1. 3-part pipe: Label | Description | Custom Message
+  const opt1 = parseSingleOption("Staff Applications | Apply to join staff | Applications are currently OPEN! Fill out the form at https://ptb.bank/apply");
+  assert.equal(opt1.label, "Staff Applications");
+  assert.equal(opt1.description, "Apply to join staff");
+  assert.equal(opt1.responseMessage, "Applications are currently OPEN! Fill out the form at https://ptb.bank/apply");
+
+  // 2. reply: prefix format
+  const opt2 = parseSingleOption("Interest Rates | reply: Current interest rate is 5% APY credited every Friday.");
+  assert.equal(opt2.label, "Interest Rates");
+  assert.equal(opt2.responseMessage, "Current interest rate is 5% APY credited every Friday.");
+
+  // 3. Multi-line block
+  const opt3 = parseSingleOption("Vault Access\nHigh-security vault\nVaults can only be accessed during banking hours with a staff member present.");
+  assert.equal(opt3.label, "Vault Access");
+  assert.equal(opt3.description, "High-security vault");
+  assert.match(opt3.responseMessage, /Vaults can only be accessed/);
+
+  // 4. Array input to parseDropdownOptions preserving multi-line custom messages
+  const multiLineOptions = [
+    "Branch Hours | Lobby times | Mon-Fri: 9am - 5pm\nSat: 10am - 2pm\nSun: Closed",
+    "Mortgages | Home loans | Contact our mortgage specialists to apply.",
+  ];
+  const parsed = parseDropdownOptions(multiLineOptions);
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].label, "Branch Hours");
+  assert.match(parsed[0].responseMessage, /Mon-Fri: 9am - 5pm/);
+  assert.equal(parsed[1].label, "Mortgages");
+  assert.equal(parsed[1].responseMessage, "Contact our mortgage specialists to apply.");
+});
+
+test("handleServerEmbedDropdownSelect delivers customized response message and link button when an option is chosen", async () => {
+  const customId = "server-embed-dropdown:custom-test-1";
+  const options = [
+    {
+      label: "VIP Perks",
+      value: "opt_1_vip_perks",
+      description: "Exclusive member benefits",
+      responseMessage: "Welcome VIP! Visit our lounge at https://discord.gg/ptb-vip for priority lines.",
+    },
+    {
+      label: "Standard Banking",
+      value: "opt_2_standard_banking",
+      description: "General accounts",
+    },
+  ];
+
+  // Save options to cache
+  await saveDropdownOptionResponses(null, customId, options);
+
+  let sentPayload = null;
+  const interactionWithCustomMessage = {
+    customId,
+    values: ["opt_1_vip_perks"],
+    component: {
+      options: [
+        { label: "VIP Perks", value: "opt_1_vip_perks", description: "Exclusive member benefits" },
+      ],
+    },
+    deferred: false,
+    replied: false,
+    reply: async (payload) => { sentPayload = payload; },
+  };
+
+  await handleServerEmbedDropdownSelect(interactionWithCustomMessage);
+
+  assert.ok(sentPayload);
+  // Delivers customized response message
+  assert.match(sentPayload.content, /Welcome VIP!/);
+  assert.match(sentPayload.content, /https:\/\/discord\.gg\/ptb-vip/);
+  assert.match(sentPayload.content, /# VIP Perks/);
+  assert.match(sentPayload.content, /-# Pacific Trust Bank • Interactive Menu/);
+
+  // Also generated an ActionRow with a Link button
+  assert.ok(Array.isArray(sentPayload.components));
+  assert.equal(sentPayload.components.length, 1);
+  const buttonJson = sentPayload.components[0].toJSON().components[0];
+  assert.equal(buttonJson.style, 5); // Link button
+  assert.equal(buttonJson.url, "https://discord.gg/ptb-vip");
+  assert.equal(buttonJson.label, "Open Link");
+});
+
+test("handleServerEmbedDropdownSelect retrieves customized response from SQLite database when cache is clear", async () => {
+  const customId = "server-embed-dropdown:db-test-2";
+  const selectedValue = "opt_loan_inquiry";
+  const dbRows = [
+    {
+      response_message: "Loan applications require a minimum account balance of 1,000 PTB credits.",
+    },
+  ];
+
+  const mockDb = {
+    execute: async ({ sql, args }) => {
+      if (sql.includes("SELECT response_message FROM embed_dropdown_options")) {
+        return { rows: dbRows };
+      }
+      return { rows: [] };
+    },
+  };
+
+  let sentReply = null;
+  const interaction = {
+    customId,
+    values: [selectedValue],
+    component: {
+      options: [
+        { label: "Loan Inquiry", value: selectedValue, description: "Check borrowing criteria" },
+      ],
+    },
+    deferred: true,
+    replied: false,
+    editReply: async (payload) => { sentReply = payload; },
+  };
+
+  // Ensure memory cache is clear for this key
+  dropdownCustomResponses.delete(`${customId}:${selectedValue}`);
+  dropdownCustomResponses.delete(selectedValue);
+
+  await handleServerEmbedDropdownSelect(interaction, mockDb);
+
+  assert.ok(sentReply);
+  assert.match(sentReply.content, /Loan applications require a minimum account balance/);
+  assert.match(sentReply.content, /# Loan Inquiry/);
+});
+
+
 
 

@@ -13,6 +13,7 @@ import {
   ticketDepositSchemaStatements,
 } from "./ticket-deposit.js";
 import { treasurySchemaStatements } from "./treasury-ops.js";
+import { DEFAULT_SUPPORT_STAFF_ROLE_ID, isTicketStaff, ticketConfig } from "./ticket-config.js";
 
 const createdDirs = [];
 test.after(async () => {
@@ -576,3 +577,26 @@ test("OCR failures are reported in the ticket and withdraw tickets never run OCR
     await db.close();
   }
 });
+
+test("support staff role 1566831947328520233 is recognized and granted ticket access by default", () => {
+  assert.equal(DEFAULT_SUPPORT_STAFF_ROLE_ID, "1566831947328520233");
+
+  // When TICKET_STAFF_ROLE_IDS is not provided, default includes 1566831947328520233
+  const cfg = ticketConfig({});
+  assert.ok(cfg.staffRoleIds.includes("1566831947328520233"));
+
+  // Non-staff user without role cannot access
+  const nonStaffInteraction = {
+    memberPermissions: { has: () => false },
+    member: { roles: { cache: new Set(["regular-user-role"]) } },
+  };
+  assert.equal(isTicketStaff(nonStaffInteraction), false);
+
+  // User with role 1566831947328520233 has ticket staff access
+  const staffInteraction = {
+    memberPermissions: { has: () => false },
+    member: { roles: { cache: new Set(["1566831947328520233"]) } },
+  };
+  assert.equal(isTicketStaff(staffInteraction), true);
+});
+

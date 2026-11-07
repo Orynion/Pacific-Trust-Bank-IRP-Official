@@ -17,9 +17,9 @@ export const ephemeralReply = { flags: MessageFlags.Ephemeral };
 export const ticketSchemaStatements = [
   `CREATE TABLE IF NOT EXISTS tickets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK (kind IN ('deposit', 'withdraw')),
+    kind TEXT NOT NULL,
     requester_id TEXT NOT NULL,
-    amount INTEGER NOT NULL CHECK (amount > 0),
+    amount INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'completed')),
     channel_id TEXT,
     ledger_id INTEGER,
@@ -49,20 +49,60 @@ export const ticketSchemaStatements = [
 ];
 
 export function ticketCode(ticket) {
-  return `PTB-${ticket.kind === "deposit" ? "D" : "W"}-${ticket.id}`;
+  if (ticket?.kind === "withdraw") return `PTB-W-${ticket.id}`;
+  if (ticket?.kind === "deposit") return `PTB-D-${ticket.id}`;
+  return `PTB-T-${ticket.id}`;
 }
 
 /**
- * The single ticket panel/welcome payload used by both /deposit and /withdraw.
+ * Migration helper to ensure legacy databases without relaxed ticket kinds can accept custom options.
+ * @param {import("@libsql/client").Client} db
+ */
+export async function ensureTicketKindMigration(db) {
+  try {
+    const master = await db.execute("SELECT sql FROM sqlite_master WHERE name = 'tickets'");
+    const sql = master.rows[0]?.sql || "";
+    if (sql.includes("CHECK (kind IN ('deposit', 'withdraw'))") || sql.includes("CHECK (amount > 0)")) {
+      await db.execute("PRAGMA foreign_keys = OFF");
+      await db.execute(`CREATE TABLE IF NOT EXISTS tickets_kind_migration_temp (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        requester_id TEXT NOT NULL,
+        amount INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'completed')),
+        channel_id TEXT,
+        ledger_id INTEGER,
+        decision_by TEXT,
+        decision_at TEXT,
+        completion_by TEXT,
+        completion_at TEXT,
+        note TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`);
+      await db.execute("INSERT INTO tickets_kind_migration_temp SELECT * FROM tickets");
+      await db.execute("DROP TABLE tickets");
+      await db.execute("ALTER TABLE tickets_kind_migration_temp RENAME TO tickets");
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_tickets_channel ON tickets (channel_id)");
+      await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_open_per_user ON tickets (requester_id, kind) WHERE status = 'pending'");
+      await db.execute("PRAGMA foreign_keys = ON");
+    }
+  } catch (err) {
+    // If table doesn't exist or already migrated, continue
+  }
+}
+
+/**
+ * The single ticket panel/welcome payload used by /deposit, /withdraw, and custom server-embed buttons.
  * Formatting comes from the shared PTB embed builder so ticket types cannot drift.
  */
-export function ticketPanelPayload({ ticket, type, amount, balance, requester, channelId }) {
+export function ticketPanelPayload({ ticket, type, amount, balance, requester, channelId, ticketTitle }) {
   const isDeposit = type === "deposit";
+  const isWithdraw = type === "withdraw" || type === "withdrawal";
+  const isCustom = !isDeposit && !isWithdraw;
 
-  return {
-    content: `${requester}, your ${type} ticket is ready!`,
-    embeds: [buildTicketWelcomeEmbed({ ticket, type, amount, balance, requester })],
-    components: [
+  const components = [];
+  if (isDeposit || isWithdraw) {
+    components.push(
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(`tkt-approve:${ticket.id}`)
@@ -83,7 +123,24 @@ export function ticketPanelPayload({ ticket, type, amount, balance, requester, c
           .setLabel("Close ticket")
           .setStyle(ButtonStyle.Secondary),
       ),
-    ],
+    );
+  } else {
+    components.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ticket-close:${channelId}:${ticket.id}`)
+          .setLabel("Close ticket")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    );
+  }
+
+  const displayName = ticketTitle || (isDeposit ? "deposit" : (isWithdraw ? "withdraw" : type));
+
+  return {
+    content: `${requester}, your ${displayName} ticket is ready!`,
+    embeds: [buildTicketWelcomeEmbed({ ticket, type, amount, balance, requester, ticketTitle })],
+    components,
     allowedMentions: { users: [requester.id] },
   };
 }
@@ -144,10 +201,10 @@ export async function rejectPendingTicketByChannel(db, channelId, note) {
 //   ptb-ticket:<kind>:<requesterId>:<amount>:<ticketId>
 // bank-ops.js builds topics with this pattern and handleTicketClose below
 // validates against it, so the two sides cannot drift.
-export const TICKET_TOPIC_REGEX = /^ptb-ticket:(deposit|withdraw):(\d+):(\d+):(\d+)$/;
+export const TICKET_TOPIC_REGEX = /^ptb-ticket:([a-z0-9_-]+):(\d+):(\d+):(\d+)$/;
 
 export function ticketTopic(kind, requesterId, amount, ticketId) {
-  return `ptb-ticket:${kind}:${requesterId}:${amount}:${ticketId}`;
+  return `ptb-ticket:${kind}:${requesterId}:${amount ?? 0}:${ticketId}`;
 }
 
 export function ticketTopicPrefix(kind, requesterId) {

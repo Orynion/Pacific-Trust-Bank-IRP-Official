@@ -29,16 +29,18 @@ import {
   schemaStatements,
 } from "./bank-ops.js";
 import { BLOXLINK_VERIFY_URL, createRegistrationEventHandler, validateRegistrationConfig, validateRoleAssignmentAccess } from "./bloxlink-registration.js";
-import { handleAddUser, handleTicketCloseModal, handleTicketCloseRequest, handleTicketDecision, ticketSchemaStatements } from "./ticket-ops.js";
+import { ensureTicketKindMigration, handleAddUser, handleTicketCloseModal, handleTicketCloseRequest, handleTicketDecision, ticketSchemaStatements } from "./ticket-ops.js";
 import { ticketConfig, validateTicketConfiguration } from "./ticket-config.js";
 import { handleDepositTicketImage, ticketDepositSchemaStatements } from "./ticket-deposit.js";
 import { ensureAmountComparisonColumn, handleTreasuryButton, handleTreasuryModal, submitTreasuryPayment, treasurySchemaStatements } from "./treasury-ops.js";
 import {
+  embedDropdownSchemaStatements,
   handleServerEmbedCommand,
   handleServerEmbedDropdownSelect,
   handleServerEmbedDynamicModalSubmit,
   handleServerEmbedModalSubmit,
   handleServerEmbedOptionCountClick,
+  handleServerEmbedTicketOpenClick,
   serverEmbedCommand,
 } from "./ptb-embeds.js";
 
@@ -399,7 +401,7 @@ function createHelpEmbed(isAdministrator) {
       name: "Administration",
       value: [
         "`/add-balance user amount` — Add funds to a registered user's ledger account.\nExample: `/add-balance user:@Alex amount:500`",
-        "`/server-embed title [description] [color] [image_url] [footer]` — Post a custom rich embed in this channel.",
+        "`/server-embed title [description] [function] [color] [image_file] [image_url] [thumbnail] [footer]` — Post a custom rich embed in this channel.",
       ].join("\n\n"),
     });
   }
@@ -629,7 +631,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
   if (interaction.isStringSelectMenu() && interaction.customId.startsWith("server-embed-dropdown")) {
     try {
-      await handleServerEmbedDropdownSelect(interaction);
+      await handleServerEmbedDropdownSelect(interaction, db);
     } catch (error) {
       console.error("PTB server embed dropdown select failed:", error);
       await respond(interaction, { content: "I could not process that selection.", ...ephemeralReply })
@@ -645,6 +647,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         console.error("PTB server embed option count click failed:", error);
         await respond(interaction, { content: "I could not open the options setup modal.", ...ephemeralReply })
           .catch((replyError) => console.error("Could not send embed options button error reply:", replyError));
+      }
+      return;
+    }
+    if (interaction.customId.startsWith("server-embed-ticket-open:") || interaction.customId.startsWith("server-embed-ticket-btn:")) {
+      try {
+        await handleServerEmbedTicketOpenClick(db, interaction);
+      } catch (error) {
+        console.error("PTB server embed ticket button click failed:", error);
+        await respond(interaction, { content: "I could not open a ticket from that button right now.", ...ephemeralReply })
+          .catch((replyError) => console.error("Could not send embed ticket button error reply:", replyError));
       }
       return;
     }
@@ -801,11 +813,12 @@ const hasDiscordConfig = Boolean(
 
 async function initializeDatabase() {
   try {
-    await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements], "write");
+    await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements, ...embedDropdownSchemaStatements], "write");
     // Adds amount_comparison to treasury tables created before the automatic
     // amount checker; fresh tables already include it and this call is idempotent.
     await ensureAmountComparisonColumn(db);
     await ensureFrozenUntilColumn(db);
+    await ensureTicketKindMigration(db);
     console.log("PTB ledger database initialized successfully.");
     return true;
   } catch (error) {
