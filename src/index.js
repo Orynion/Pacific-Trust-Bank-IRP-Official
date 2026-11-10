@@ -34,6 +34,14 @@ import { ticketConfig, validateTicketConfiguration } from "./ticket-config.js";
 import { handleDepositTicketImage, ticketDepositSchemaStatements } from "./ticket-deposit.js";
 import { ensureAmountComparisonColumn, handleTreasuryButton, handleTreasuryModal, submitTreasuryPayment, treasurySchemaStatements } from "./treasury-ops.js";
 import {
+  applicationSchemaStatements,
+  applicationCommand,
+  handleApplicationCommand,
+  handleApplicationApplyButton,
+  handleApplicationMessageCreate,
+  handleApplicationReviewButton,
+} from "./applications.js";
+import {
   embedDropdownSchemaStatements,
   handleServerEmbedCommand,
   handleServerEmbedDropdownSelect,
@@ -537,7 +545,13 @@ const handleGuildMemberUpdate = createRegistrationEventHandler({
   apiKey: process.env.BLOXLINK_API_KEY,
 });
 client.on(Events.GuildMemberUpdate, (oldMember, newMember) => void handleGuildMemberUpdate(oldMember, newMember));
-client.on(Events.MessageCreate, (message) => {
+client.on(Events.MessageCreate, async (message) => {
+  const handledApp = await handleApplicationMessageCreate(db, message).catch((error) => {
+    console.error("PTB application DM message handler failed:", error);
+    return false;
+  });
+  if (handledApp) return;
+
   void handleDepositTicketImage(db, message).catch((error) => console.error("PTB deposit receipt analysis failed:", error));
 });
 
@@ -640,13 +654,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
   if (interaction.isButton()) {
-    if (interaction.customId.startsWith("embed-opts-count:")) {
+    if (interaction.customId === "app:apply_rep") {
       try {
-        await handleServerEmbedOptionCountClick(interaction);
+        await handleApplicationApplyButton(db, interaction);
       } catch (error) {
-        console.error("PTB server embed option count click failed:", error);
-        await respond(interaction, { content: "I could not open the options setup modal.", ...ephemeralReply })
-          .catch((replyError) => console.error("Could not send embed options button error reply:", replyError));
+        console.error("PTB application apply button failed:", error);
+        await respond(interaction, { content: "I could not start your application right now.", ...ephemeralReply })
+          .catch((replyError) => console.error("Could not send apply button error reply:", replyError));
+      }
+      return;
+    }
+    if (interaction.customId.startsWith("app:accept:") || interaction.customId.startsWith("app:reject:")) {
+      try {
+        await handleApplicationReviewButton(db, interaction);
+      } catch (error) {
+        console.error("PTB application review button failed:", error);
+        await respond(interaction, { content: "I could not process that application review action.", ...ephemeralReply })
+          .catch((replyError) => console.error("Could not send review button error reply:", replyError));
       }
       return;
     }
@@ -802,6 +826,8 @@ async function runChatCommand(interaction) {
     await submitTreasuryPayment(db, interaction, { reviewChannelId: process.env.TREASURY_REVIEW_CHANNEL_ID, reviewerRoleIds: TREASURY_REVIEW_ROLES });
   } else if (interaction.commandName === "server-embed") {
     await handleServerEmbedCommand(interaction);
+  } else if (interaction.commandName === "application") {
+    await handleApplicationCommand(db, interaction);
   }
 }
 
@@ -813,7 +839,7 @@ const hasDiscordConfig = Boolean(
 
 async function initializeDatabase() {
   try {
-    await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements, ...embedDropdownSchemaStatements], "write");
+    await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements, ...embedDropdownSchemaStatements, ...applicationSchemaStatements], "write");
     // Adds amount_comparison to treasury tables created before the automatic
     // amount checker; fresh tables already include it and this call is idempotent.
     await ensureAmountComparisonColumn(db);
@@ -875,6 +901,7 @@ async function startDiscord() {
             treasuryCommand.toJSON(),
             treasurySubmitCommand.toJSON(),
             serverEmbedCommand.toJSON(),
+            applicationCommand.toJSON(),
           ],
         },
       );

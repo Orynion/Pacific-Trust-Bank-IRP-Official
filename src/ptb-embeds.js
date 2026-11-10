@@ -1694,7 +1694,7 @@ export async function handleServerEmbedCommand(interaction) {
 
   const files = imageAttachment ? [imageAttachment] : [];
 
-  // 4. Build dropdown or ticket buttons component if options are provided
+  // 4. Build dropdown or ticket/application buttons component if options are provided
   let components = [];
   if (optionsRaw) {
     const parsedOptions = parseDropdownOptions(optionsRaw);
