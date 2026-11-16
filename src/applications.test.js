@@ -6,10 +6,15 @@ import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { EmbedBuilder, MessageFlags, PermissionFlagsBits } from "discord.js";
 import {
+  activeApplicationSessions,
+  APPLICATION_QUESTIONS,
   applicationSchemaStatements,
   ensureApplicationRejectionReasonColumn,
+  handleApplicationApplyButton,
   handleApplicationRejectModal,
   handleApplicationReviewButton,
+  handleDirectMessage,
+  SESSION_TIMEOUT_MS,
 } from "./applications.js";
 
 const dirs = [];
@@ -265,6 +270,214 @@ test("rejection modal refuses non-admins and prevents duplicate review overwrite
     assert.equal(row.rows[0].reviewed_by, "3001");
     assert.equal(row.rows[0].rejection_reason, "First decision");
   } finally {
+    await db.close();
+  }
+});
+
+test("interactive DM questionnaire progresses through 5 questions, guards empty replies, confirms via embed, and notifies staff", async () => {
+  const db = await openDb();
+  const userId = "200000000000000099";
+  activeApplicationSessions.delete(userId);
+  const sentDmMessages = [];
+  const staffChannelMessages = [];
+
+  await db.execute({
+    sql: "INSERT INTO application_settings (key, value) VALUES ('status', 'open'), ('review_channel_id', 'rev-chan-1')",
+    args: [],
+  });
+
+  const mockClient = {
+    channels: {
+      async fetch(id) {
+        if (id === "rev-chan-1") {
+          return {
+            async send(payload) {
+              staffChannelMessages.push(payload);
+            },
+          };
+        }
+        return null;
+      },
+    },
+  };
+
+  try {
+    let editReplyPayload = null;
+    await handleApplicationApplyButton(db, {
+      customId: "app:apply_rep",
+      user: {
+        id: userId,
+        username: "ApplicantRep",
+        async createDM() {
+          return {
+            async send(payload) {
+              sentDmMessages.push(payload);
+            },
+          };
+        },
+      },
+      async deferReply() {},
+      async editReply(payload) {
+        editReplyPayload = payload;
+      },
+    });
+
+    assert.match(editReplyPayload.content, /Questionnaire Started/);
+    assert.equal(sentDmMessages.length, 1);
+    assert.match(sentDmMessages[0].content, /1\/5\./);
+    assert.ok(activeApplicationSessions.has(userId));
+
+    // Empty reply should prompt again without advancing step
+    const replies = [];
+    const makeDmMsg = (content) => ({
+      author: { id: userId, username: "ApplicantRep", tag: "ApplicantRep#0001", bot: false },
+      guild: null,
+      client: mockClient,
+      content,
+      async reply(payload) {
+        replies.push(payload);
+      },
+    });
+
+    const emptyHandled = await handleDirectMessage(makeDmMsg("   "), mockClient, db);
+    assert.equal(emptyHandled, true);
+    assert.equal(activeApplicationSessions.get(userId).step, 0);
+    assert.match(replies.at(-1), /Please enter a text answer/);
+
+    // Answer all 5 questions
+    const answers = [
+      "RobloxUser / 12345678",
+      "ApplicantRep#0001",
+      "2 years banking RP",
+      "EST / 15 hours",
+      "Verify staff approval first before processing",
+    ];
+    for (let i = 0; i < answers.length; i += 1) {
+      const handled = await handleDirectMessage(makeDmMsg(answers[i]), mockClient, db);
+      assert.equal(handled, true);
+    }
+
+    // Session cleared, DB row inserted, DM confirmation embed sent, staff review posted
+    assert.equal(activeApplicationSessions.has(userId), false);
+    const dbRes = await db.execute({ sql: "SELECT * FROM applications WHERE user_id = ?", args: [userId] });
+    assert.equal(dbRes.rows.length, 1);
+    assert.equal(dbRes.rows[0].status, "pending");
+    const parsedAnswers = JSON.parse(dbRes.rows[0].answers_json);
+    assert.equal(parsedAnswers.role_desired, "Bank Representative");
+    assert.equal(parsedAnswers.roblox_identity, answers[0]);
+    assert.equal(parsedAnswers.scenario, answers[4]);
+
+    const finalDmReply = replies.at(-1);
+    assert.ok(finalDmReply.embeds && finalDmReply.embeds.length === 1);
+    assert.match(finalDmReply.embeds[0].data.title, /Application Submitted/);
+
+    assert.equal(staffChannelMessages.length, 1);
+    assert.equal(staffChannelMessages[0].components.length, 1);
+    assert.equal(staffChannelMessages[0].embeds[0].data.fields.length, 6);
+  } finally {
+    activeApplicationSessions.delete(userId);
+    await db.close();
+  }
+});
+
+test("DM questionnaire supports cancel and expires after 30 minutes (SESSION_TIMEOUT_MS)", async () => {
+  const db = await openDb();
+  const userId = "200000000000000088";
+  activeApplicationSessions.delete(userId);
+  const replies = [];
+  const makeDmMsg = (content) => ({
+    author: { id: userId, username: "CancelUser", bot: false },
+    guild: null,
+    content,
+    async reply(payload) {
+      replies.push(payload);
+    },
+  });
+
+  try {
+    activeApplicationSessions.set(userId, {
+      roleDesired: "Bank Teller",
+      step: 1,
+      currentIndex: 1,
+      answers: { roblox_identity: "User / 1" },
+      startedAt: Date.now() - SESSION_TIMEOUT_MS - 1000,
+      createdAt: Date.now() - SESSION_TIMEOUT_MS - 1000,
+    });
+
+    const expiredHandled = await handleDirectMessage(makeDmMsg("My answer"), null, db);
+    assert.equal(expiredHandled, true);
+    assert.equal(activeApplicationSessions.has(userId), false);
+    assert.match(replies.at(-1), /Expired/i);
+
+    // Start a fresh session and cancel it
+    activeApplicationSessions.set(userId, {
+      roleDesired: "Bank Teller",
+      step: 0,
+      currentIndex: 0,
+      answers: {},
+      startedAt: Date.now(),
+      createdAt: Date.now(),
+    });
+    const cancelHandled = await handleDirectMessage(makeDmMsg("CANCEL"), null, db);
+    assert.equal(cancelHandled, true);
+    assert.equal(activeApplicationSessions.has(userId), false);
+    assert.match(replies.at(-1), /Cancelled/i);
+  } finally {
+    activeApplicationSessions.delete(userId);
+    await db.close();
+  }
+});
+
+test("OWNER_ROLE_ID reviewer can accept via app:review:accept and assign REPRESENTATIVE_ROLE_ID", async () => {
+  const db = await openDb();
+  const appId = await seedPendingApplication(db, "200000000000000077");
+  const prevOwner = process.env.OWNER_ROLE_ID;
+  const prevRep = process.env.REPRESENTATIVE_ROLE_ID;
+  process.env.OWNER_ROLE_ID = "owner-role-1";
+  process.env.REPRESENTATIVE_ROLE_ID = "rep-role-1";
+
+  const sentDms = [];
+  const addedRoles = [];
+  const message = makeReviewMessage();
+
+  try {
+    await handleApplicationReviewButton(db, {
+      customId: `app:review:accept:${appId}:200000000000000077`,
+      user: { id: "owner-1", tag: "Owner#0001" },
+      member: {
+        permissions: { has: () => false },
+        roles: { cache: new Set(["owner-role-1"]) },
+      },
+      guild: {
+        members: {
+          async fetch(id) {
+            return {
+              id,
+              roles: {
+                async add(roleId) {
+                  addedRoles.push(roleId);
+                },
+              },
+            };
+          },
+        },
+      },
+      message,
+      client: makeClientWithDmSink(sentDms),
+      async deferUpdate() {},
+    });
+
+    assert.deepEqual(addedRoles, ["rep-role-1"]);
+    assert.equal(sentDms.length, 1);
+    assert.match(sentDms[0].content, /ACCEPTED/);
+    const row = await db.execute({ sql: "SELECT status, reviewed_by FROM applications WHERE id = ?", args: [appId] });
+    assert.equal(row.rows[0].status, "accepted");
+    assert.equal(row.rows[0].reviewed_by, "owner-1");
+  } finally {
+    if (prevOwner === undefined) delete process.env.OWNER_ROLE_ID;
+    else process.env.OWNER_ROLE_ID = prevOwner;
+    if (prevRep === undefined) delete process.env.REPRESENTATIVE_ROLE_ID;
+    else process.env.REPRESENTATIVE_ROLE_ID = prevRep;
     await db.close();
   }
 });

@@ -56,9 +56,15 @@ export async function ensureApplicationRejectionReasonColumn(db) {
  * In-memory active application questionnaire sessions: userId -> sessionObject
  */
 export const activeApplicationSessions = new Map();
+export const activeSessions = activeApplicationSessions;
 
 /**
- * Questionnaire questions for Bank Manager / Bank Teller role applications.
+ * Maximum idle/total lifetime of a DM questionnaire session (30 minutes).
+ */
+export const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * Questionnaire questions for Bank Manager / Bank Teller / Representative role applications.
  */
 export const APPLICATION_QUESTIONS = [
   {
@@ -82,6 +88,7 @@ export const APPLICATION_QUESTIONS = [
     prompt: "Scenario: A citizen requests a 50,000 credit withdrawal without staff approval. How do you handle this request?",
   },
 ];
+export const DEFAULT_APPLICATION_QUESTIONS = APPLICATION_QUESTIONS;
 
 /**
  * Slash command definition for /application
@@ -146,18 +153,31 @@ export async function getApplicationReviewChannelId(db) {
 }
 
 /**
+ * Resolve the staff review channel ID using DB settings and environment fallbacks.
+ * @param {any} db
+ * @returns {Promise<string|null>}
+ */
+export async function resolveReviewChannelId(db) {
+  const fromDb = await getApplicationReviewChannelId(db);
+  return (
+    fromDb ||
+    process.env.APPLICATIONS_REVIEW_CHANNEL_ID ||
+    process.env.DEFAULT_APPLICATIONS_REVIEW_CHANNEL_ID ||
+    process.env.APPLICATIONS_CHANNEL_ID ||
+    process.env.MOD_LOG_CHANNEL_ID ||
+    process.env.TICKET_LOG_CHANNEL_ID ||
+    null
+  );
+}
+
+/**
  * Handles /application status:open / close command.
  * @param {any} db
  * @param {import("discord.js").ChatInputCommandInteraction} interaction
  * @returns {Promise<void>}
  */
 export async function handleApplicationCommand(db, interaction) {
-  const hasAdmin = Boolean(
-    interaction.member?.permissions?.has(PermissionFlagsBits.Administrator) ||
-    interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
-  );
-
-  if (!hasAdmin) {
+  if (!isApplicationReviewer(interaction)) {
     return interaction.reply({
       content: "# Access Denied\nOnly server administrators can manage staff applications.",
       flags: MessageFlags.Ephemeral,
@@ -218,17 +238,24 @@ export async function handleApplicationCommand(db, interaction) {
 }
 
 /**
- * Handles clicks on application buttons (app:apply:manager or app:apply:teller).
+ * Handles clicks on application buttons (app:apply:manager, app:apply:teller, or app:apply_rep).
  * @param {any} db
  * @param {import("discord.js").ButtonInteraction} interaction
  * @returns {Promise<void>}
  */
 export async function handleApplicationApplyButton(db, interaction) {
-  if (!interaction.customId?.startsWith("app:apply:")) return;
+  if (!interaction.customId?.startsWith("app:apply")) return;
 
-  const roleType = interaction.customId === "app:apply:manager" ? "Bank Manager" : "Bank Teller";
+  let roleType = "Bank Teller";
+  if (interaction.customId === "app:apply:manager") {
+    roleType = "Bank Manager";
+  } else if (interaction.customId === "app:apply_rep") {
+    roleType = "Bank Representative";
+  }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
 
   const isOpen = await areApplicationsOpen(db);
   if (!isOpen) {
@@ -251,35 +278,44 @@ export async function handleApplicationApplyButton(db, interaction) {
     }
   } catch {}
 
-  if (activeApplicationSessions.has(userId)) {
-    return interaction.editReply({
-      content: "# Questionnaire Active\nYou already have an active application questionnaire session open in your Direct Messages. Check your DMs to complete it (or type `cancel` to abort).",
-    });
+  const existingSession = activeApplicationSessions.get(userId);
+  if (existingSession) {
+    const startedAt = existingSession.startedAt ?? existingSession.createdAt ?? 0;
+    if (Date.now() - startedAt > SESSION_TIMEOUT_MS) {
+      activeApplicationSessions.delete(userId);
+    } else {
+      return interaction.editReply({
+        content: "# Questionnaire Active\nYou already have an active application questionnaire session open in your Direct Messages. Check your DMs to complete it (or type `cancel` to abort).",
+      });
+    }
   }
 
   try {
     const dmChannel = await interaction.user.createDM();
     const firstQ = APPLICATION_QUESTIONS[0];
+    const now = Date.now();
 
     activeApplicationSessions.set(userId, {
       roleDesired: roleType,
+      step: 0,
       currentIndex: 0,
       answers: {},
-      createdAt: Date.now(),
+      startedAt: now,
+      createdAt: now,
     });
 
     const introMsg = [
       "# Pacific Trust Bank | Staff Application",
       `Applying for position: **${roleType}**`,
-      "Please answer the following questions honestly. You can type `cancel` at any time to abort this questionnaire.",
+      `Please answer the following ${APPLICATION_QUESTIONS.length} questions honestly (session expires after 30 minutes). You can type \`cancel\` at any time to abort this questionnaire.`,
       "",
-      `**1. ${firstQ.prompt}**`,
+      `**1/${APPLICATION_QUESTIONS.length}. ${firstQ.prompt}**`,
     ].join("\n");
 
     await dmChannel.send({ content: introMsg });
 
     return interaction.editReply({
-      content: `# Questionnaire Started\nI have sent you a Direct Message with the first application question for **${roleType}**! Please check your DMs.`,
+      content: `# Questionnaire Started\nI have sent you a Direct Message with Question 1 of ${APPLICATION_QUESTIONS.length} for **${roleType}**! Please check your DMs.`,
     });
   } catch (err) {
     console.error("[PTB Applications] Could not open DM with user:", err);
@@ -288,19 +324,84 @@ export async function handleApplicationApplyButton(db, interaction) {
     });
   }
 }
+export const handleApplyButton = handleApplicationApplyButton;
+
+/**
+ * Post a staff review embed with Accept / Reject buttons to the configured review channel.
+ * @param {{ db: any, client: any, appId: number|string, user: any, roleDesired: string, answers: Record<string, string> }} params
+ * @returns {Promise<boolean>}
+ */
+export async function notifyStaffReview({ db, client, appId, user, roleDesired, answers }) {
+  try {
+    const reviewChannelId = await resolveReviewChannelId(db);
+    if (!reviewChannelId || !client?.channels?.fetch) return false;
+
+    const reviewChannel = await client.channels.fetch(reviewChannelId).catch(() => null);
+    if (!reviewChannel || typeof reviewChannel.send !== "function") return false;
+
+    const userId = user?.id || "unknown";
+    const userTag = user?.tag || user?.username || "unknown";
+
+    const reviewEmbed = new EmbedBuilder()
+      .setColor(0x2563EB)
+      .setTitle(`New Staff Application #${appId} (${roleDesired})`)
+      .setDescription(`Applicant: <@${userId}> (\`${userTag}\`)`)
+      .addFields(
+        { name: "Position Desired", value: String(roleDesired || "Bank Staff").slice(0, 1024) },
+        { name: "1. Roblox Identity", value: String(answers?.roblox_identity || "N/A").slice(0, 1024) },
+        { name: "2. Discord Identity", value: String(answers?.discord_identity || "N/A").slice(0, 1024) },
+        { name: "3. Experience", value: String(answers?.experience || "N/A").slice(0, 1024) },
+        { name: "4. Availability", value: String(answers?.availability || "N/A").slice(0, 1024) },
+        { name: "5. Scenario Response", value: String(answers?.scenario || "N/A").slice(0, 1024) },
+      )
+      .setTimestamp()
+      .setFooter({ text: `Application ID: ${appId} • Pacific Trust Bank Staff Review` });
+
+    const actionRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`app:accept:${appId}:${userId}`)
+        .setLabel("Accept Application")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`app:reject:${appId}:${userId}`)
+        .setLabel("Reject Application")
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    await reviewChannel.send({
+      content: "@everyone",
+      embeds: [reviewEmbed],
+      components: [actionRow],
+    });
+    return true;
+  } catch (err) {
+    console.error("[PTB Applications] Could not forward application review embed to staff channel:", err);
+    return false;
+  }
+}
 
 /**
  * Handles incoming DM messages from users completing active application sessions.
  * @param {any} db
  * @param {import("discord.js").Message} message
+ * @param {any} [client]
  * @returns {Promise<boolean>} returns true if the message was handled as part of an application session
  */
-export async function handleApplicationMessageCreate(db, message) {
-  if (message.author.bot || message.guild) return false;
+export async function handleApplicationMessageCreate(db, message, client = null) {
+  if (!message || message.author?.bot || message.guild) return false;
 
   const userId = message.author.id;
   const session = activeApplicationSessions.get(userId);
   if (!session) return false;
+
+  const startedAt = session.startedAt ?? session.createdAt ?? 0;
+  if (Date.now() - startedAt > SESSION_TIMEOUT_MS) {
+    activeApplicationSessions.delete(userId);
+    await message.reply(
+      "Application Session Expired: Your questionnaire timed out after 30 minutes of inactivity. Please click the Apply button in the server again to restart."
+    ).catch(() => {});
+    return true;
+  }
 
   const content = message.content?.trim() || "";
   if (/^cancel$/i.test(content)) {
@@ -309,14 +410,25 @@ export async function handleApplicationMessageCreate(db, message) {
     return true;
   }
 
-  const currentQ = APPLICATION_QUESTIONS[session.currentIndex];
-  session.answers[currentQ.id] = content;
-  session.currentIndex++;
+  if (!content) {
+    const qIndex = session.step ?? session.currentIndex ?? 0;
+    const currentQ = APPLICATION_QUESTIONS[qIndex];
+    await message.reply(
+      `Please enter a text answer for **${qIndex + 1}/${APPLICATION_QUESTIONS.length}. ${currentQ.prompt}** (or type \`cancel\` to abort).`
+    ).catch(() => {});
+    return true;
+  }
 
-  if (session.currentIndex < APPLICATION_QUESTIONS.length) {
-    const nextQ = APPLICATION_QUESTIONS[session.currentIndex];
-    const qNum = session.currentIndex + 1;
-    await message.reply(`**${qNum}. ${nextQ.prompt}**`).catch(() => {});
+  const qIndex = session.step ?? session.currentIndex ?? 0;
+  const currentQ = APPLICATION_QUESTIONS[qIndex];
+  session.answers[currentQ.id] = content.slice(0, 1000);
+  session.step = qIndex + 1;
+  session.currentIndex = session.step;
+
+  if (session.step < APPLICATION_QUESTIONS.length) {
+    const nextQ = APPLICATION_QUESTIONS[session.step];
+    const qNum = session.step + 1;
+    await message.reply(`**${qNum}/${APPLICATION_QUESTIONS.length}. ${nextQ.prompt}**`).catch(() => {});
     return true;
   }
 
@@ -334,7 +446,7 @@ export async function handleApplicationMessageCreate(db, message) {
       args: [userId, message.author.tag || message.author.username, answersJson],
     });
     appId = Number(insertRes.lastInsertRowid);
-    if (appId === undefined || appId === null) {
+    if (appId === undefined || appId === null || Number.isNaN(appId)) {
       const idRes = await db.execute({ sql: "SELECT last_insert_rowid() AS id", args: [] });
       appId = Number(idRes.rows[0].id);
     }
@@ -344,63 +456,66 @@ export async function handleApplicationMessageCreate(db, message) {
     return true;
   }
 
-  await message.reply(
-    "**Application Submitted Successfully!**\n" +
-    "Thank you for applying to join the Pacific Trust Bank staff team. Your submission has been forwarded to bank administrators for review."
-  ).catch(() => {});
+  const confirmationEmbed = new EmbedBuilder()
+    .setColor(0x0B3D2E)
+    .setTitle("Pacific Trust Bank | Application Submitted")
+    .setDescription(
+      "Thank you for applying to join the Pacific Trust Bank staff team! Your responses have been forwarded to bank administrators for review."
+    )
+    .addFields(
+      { name: "Application ID", value: `#${appId}`, inline: true },
+      { name: "Position Desired", value: session.roleDesired, inline: true },
+      { name: "Status", value: "Pending Review", inline: true },
+    )
+    .setTimestamp()
+    .setFooter({ text: "Pacific Trust Bank • You will receive a DM once reviewed." });
 
-  // Forward review embed to Staff Review Channel and ping everyone who can see the channel
-  try {
-    const reviewChannelId = await getApplicationReviewChannelId(db);
-    if (reviewChannelId && message.client?.channels) {
-      const reviewChannel = await message.client.channels.fetch(reviewChannelId).catch(() => null);
-      if (reviewChannel && typeof reviewChannel.send === "function") {
-        const answers = session.answers;
-        const reviewEmbed = new EmbedBuilder()
-          .setColor(0x2563EB)
-          .setTitle(`New Staff Application #${appId} (${session.roleDesired})`)
-          .setDescription(`Applicant: <@${userId}> (\`${message.author.tag || message.author.username}\`)`)
-          .addFields(
-            { name: "Position Desired", value: session.roleDesired },
-            { name: "Roblox Identity", value: answers.roblox_identity || "N/A" },
-            { name: "Discord Identity", value: answers.discord_identity || "N/A" },
-            { name: "Experience", value: answers.experience || "N/A" },
-            { name: "Availability", value: answers.availability || "N/A" },
-            { name: "Scenario Response", value: answers.scenario || "N/A" },
-          )
-          .setTimestamp()
-          .setFooter({ text: `Application ID: ${appId} • Pacific Trust Bank Staff Review` });
+  await message.reply({
+    content: "**Application Submitted Successfully!**",
+    embeds: [confirmationEmbed],
+  }).catch(() => {});
 
-        const actionRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`app:accept:${appId}:${userId}`)
-            .setLabel("Accept Application")
-            .setStyle(ButtonStyle.Success),
-          new ButtonBuilder()
-            .setCustomId(`app:reject:${appId}:${userId}`)
-            .setLabel("Reject Application")
-            .setStyle(ButtonStyle.Danger)
-        );
-
-        await reviewChannel.send({
-          content: "@everyone",
-          embeds: [reviewEmbed],
-          components: [actionRow],
-        });
-      }
-    }
-  } catch (err) {
-    console.error("[PTB Applications] Could not forward application review embed to staff channel:", err);
-  }
+  await notifyStaffReview({
+    db,
+    client: client || message.client,
+    appId,
+    user: message.author,
+    roleDesired: session.roleDesired,
+    answers: session.answers,
+  });
 
   return true;
 }
 
+/**
+ * Spec-aligned wrapper for DM message routing: handleDirectMessage(message, client, db).
+ * @param {import("discord.js").Message} message
+ * @param {any} client
+ * @param {any} db
+ * @returns {Promise<boolean>}
+ */
+export function handleDirectMessage(message, client, db) {
+  return handleApplicationMessageCreate(db, message, client);
+}
+
 function isApplicationReviewer(interaction) {
-  return Boolean(
+  if (
     interaction.member?.permissions?.has(PermissionFlagsBits.Administrator) ||
     interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
-  );
+  ) {
+    return true;
+  }
+  const cache = interaction.member?.roles?.cache;
+  if (!cache || typeof cache.has !== "function") return false;
+
+  const allowedRoleIds = [
+    process.env.OWNER_ROLE_ID,
+    ...String(process.env.APPLICATIONS_REVIEWER_ROLE_IDS ?? "").split(","),
+  ]
+    .map((id) => String(id ?? "").trim())
+    .filter(Boolean);
+
+  return allowedRoleIds.some((roleId) => cache.has(roleId));
 }
 
 /**
@@ -460,7 +575,9 @@ async function finalizeApplicationReview(db, interaction, { action, appId, appli
   }
 
   if (action === "accept" && interaction.guild) {
-    const repRoleId = process.env.REGISTERED_ROLE_ID || process.env.REPRESENTATIVE_ROLE_ID;
+    const repRoleId =
+      process.env.REPRESENTATIVE_ROLE_ID ||
+      process.env.REGISTERED_ROLE_ID;
     if (repRoleId) {
       try {
         const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
@@ -478,14 +595,29 @@ async function finalizeApplicationReview(db, interaction, { action, appId, appli
     if (applicantUser) {
       const dm = await applicantUser.createDM();
       let notice;
+      const decisionEmbed = new EmbedBuilder()
+        .setTitle(`Pacific Trust Bank | Application #${appId}`)
+        .setTimestamp()
+        .setFooter({ text: "Pacific Trust Bank • Staff Applications" });
+
       if (action === "accept") {
         notice = `**Congratulations! Your Pacific Trust Bank staff application (#${appId}) has been ACCEPTED.** Welcome to the bank team.`;
+        decisionEmbed
+          .setColor(0x10B981)
+          .setDescription("Your application has been **ACCEPTED**. Welcome to the Pacific Trust Bank team!");
       } else if (cleanReason) {
         notice = `**Update on your Pacific Trust Bank staff application (#${appId})**: Thank you for applying. Unfortunately, your application was not accepted at this time.\n**Reason:** ${cleanReason}`;
+        decisionEmbed
+          .setColor(0xEF4444)
+          .setDescription("Thank you for applying. Unfortunately, your application was not accepted at this time.")
+          .addFields({ name: "Reason", value: cleanReason });
       } else {
         notice = `**Update on your Pacific Trust Bank staff application (#${appId})**: Thank you for applying. Unfortunately, your application was not accepted at this time.`;
+        decisionEmbed
+          .setColor(0xEF4444)
+          .setDescription("Thank you for applying. Unfortunately, your application was not accepted at this time.");
       }
-      await dm.send({ content: notice }).catch(() => {});
+      await dm.send({ content: notice, embeds: [decisionEmbed] }).catch(() => {});
     }
   } catch {}
 
@@ -516,7 +648,8 @@ async function finalizeApplicationReview(db, interaction, { action, appId, appli
 }
 
 /**
- * Handles staff review button clicks (app:accept:<appId>:<userId> or app:reject:<appId>:<userId>).
+ * Handles staff review button clicks (app:accept:<appId>:<userId>, app:reject:<appId>:<userId>,
+ * or app:review:accept:<appId>:<userId>, app:review:reject:<appId>:<userId>).
  * @param {any} db
  * @param {import("discord.js").ButtonInteraction} interaction
  * @returns {Promise<void>}
@@ -525,9 +658,10 @@ export async function handleApplicationReviewButton(db, interaction) {
   if (!interaction.customId?.startsWith("app:")) return;
 
   const parts = interaction.customId.split(":");
-  const action = parts[1]; // accept or reject
-  const appId = parts[2];
-  const applicantId = parts[3];
+  const offset = parts[1] === "review" ? 1 : 0;
+  const action = parts[1 + offset]; // accept or reject
+  const appId = parts[2 + offset];
+  const applicantId = parts[3 + offset];
 
   if (!["accept", "reject"].includes(action)) return;
 
@@ -570,6 +704,7 @@ export async function handleApplicationReviewButton(db, interaction) {
 
   return finalizeApplicationReview(db, interaction, { action, appId, applicantId });
 }
+export const handleReviewButton = handleApplicationReviewButton;
 
 /**
  * Handles modal submission for rejecting a staff application with an optional reason.

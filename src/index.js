@@ -9,6 +9,7 @@ import {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  Partials,
   PermissionFlagsBits,
   REST,
   Routes,
@@ -39,10 +40,16 @@ import {
   ensureApplicationRejectionReasonColumn,
   handleApplicationCommand,
   handleApplicationApplyButton,
-  handleApplicationMessageCreate,
   handleApplicationRejectModal,
   handleApplicationReviewButton,
+  handleDirectMessage,
 } from "./applications.js";
+import {
+  handleMessage as handleScamShieldMessage,
+  handleScamReviewButton,
+  scamShieldSchemaStatements,
+  startPeriodicScanner,
+} from "./scam-shield.js";
 import {
   embedDropdownSchemaStatements,
   handleServerEmbedCommand,
@@ -534,7 +541,20 @@ async function handleUnregister(interaction) {
   await interaction.editReply(`Your Roblox account has been disconnected from PTB. Your PTB balance and transaction history were kept. Run /register to link an account again.${roleNote}`);
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+  partials: [
+    Partials.Channel,
+    Partials.Message,
+    Partials.User,
+  ],
+});
 const registrationConfig = validateRegistrationConfig(process.env);
 if (!registrationConfig.ok) console.error(`[PTB Config] Registration unavailable; set valid guild, role IDs, and Bloxlink API key: ${registrationConfig.missing.join(", ")}`);
 let registrationRolesReady = false;
@@ -548,13 +568,32 @@ const handleGuildMemberUpdate = createRegistrationEventHandler({
 });
 client.on(Events.GuildMemberUpdate, (oldMember, newMember) => void handleGuildMemberUpdate(oldMember, newMember));
 client.on(Events.MessageCreate, async (message) => {
-  const handledApp = await handleApplicationMessageCreate(db, message).catch((error) => {
-    console.error("PTB application DM message handler failed:", error);
-    return false;
-  });
-  if (handledApp) return;
+  if (!message.guild && !message.author?.bot) {
+    const handledApp = await handleDirectMessage(message, client, db).catch((error) => {
+      console.error("PTB application DM message handler failed:", error);
+      return false;
+    });
+    if (handledApp) return;
+  }
 
-  void handleDepositTicketImage(db, message).catch((error) => console.error("PTB deposit receipt analysis failed:", error));
+  await handleScamShieldMessage(message, client, {}, db).catch((error) => {
+    console.error("PTB ScamShield message handler failed:", error);
+  });
+
+  if (message.guild) {
+    void handleDepositTicketImage(db, message).catch((error) => console.error("PTB deposit receipt analysis failed:", error));
+  }
+
+  if (
+    !message.author?.bot &&
+    client.user &&
+    !message.mentions?.everyone &&
+    message.mentions?.has?.(client.user)
+  ) {
+    await message.reply(
+      "Hello! I'm the **Pacific Trust Bank** utility bot. Use `/help` in the server to see available commands, or use an application button to apply via DM."
+    ).catch(() => {});
+  }
 });
 
 const INVITE_PERMISSIONS = 268_561_424; // Manage Channels, Manage Roles, View Channels, Send Messages, Manage Messages, Embed Links, Attach Files, Read Message History
@@ -562,6 +601,7 @@ const INVITE_PERMISSIONS = 268_561_424; // Manage Channels, Manage Roles, View C
 client.once(Events.ClientReady, async (readyClient) => {
   discordReady = true;
   console.log(`Logged in as ${readyClient.user.tag}`);
+  startPeriodicScanner(readyClient, db);
   // Membership truth comes from the live gateway cache: registration can only
   // ever work in a server this bot account actually joined.
   const memberServers = readyClient.guilds.cache.map((guild) => `${guild.name} (${guild.id})`);
@@ -666,7 +706,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
   if (interaction.isButton()) {
-    if (interaction.customId.startsWith("app:apply:")) {
+    if (interaction.customId.startsWith("app:apply")) {
       try {
         await handleApplicationApplyButton(db, interaction);
       } catch (error) {
@@ -676,13 +716,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       return;
     }
-    if (interaction.customId.startsWith("app:accept:") || interaction.customId.startsWith("app:reject:")) {
+    if (
+      interaction.customId.startsWith("app:accept:") ||
+      interaction.customId.startsWith("app:reject:") ||
+      interaction.customId.startsWith("app:review:accept:") ||
+      interaction.customId.startsWith("app:review:reject:")
+    ) {
       try {
         await handleApplicationReviewButton(db, interaction);
       } catch (error) {
         console.error("PTB application review button failed:", error);
         await respond(interaction, { content: "I could not process that application review action.", ...ephemeralReply })
           .catch((replyError) => console.error("Could not send review button error reply:", replyError));
+      }
+      return;
+    }
+    if (interaction.customId.startsWith("scam:confirm:") || interaction.customId.startsWith("scam:dismiss:")) {
+      try {
+        await handleScamReviewButton(db, interaction);
+      } catch (error) {
+        console.error("PTB ScamShield review button failed:", error);
+        await respond(interaction, { content: "I could not process that ScamShield review action.", ...ephemeralReply })
+          .catch((replyError) => console.error("Could not send ScamShield review button error reply:", replyError));
       }
       return;
     }
@@ -851,7 +906,7 @@ const hasDiscordConfig = Boolean(
 
 async function initializeDatabase() {
   try {
-    await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements, ...embedDropdownSchemaStatements, ...applicationSchemaStatements], "write");
+    await db.batch([...schemaStatements, ...ticketSchemaStatements, ...ticketDepositSchemaStatements, ...recurringChargeSchemaStatements, ...treasurySchemaStatements, ...embedDropdownSchemaStatements, ...applicationSchemaStatements, ...scamShieldSchemaStatements], "write");
     // Adds amount_comparison to treasury tables created before the automatic
     // amount checker; fresh tables already include it and this call is idempotent.
     await ensureAmountComparisonColumn(db);
