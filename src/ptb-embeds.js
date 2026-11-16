@@ -46,8 +46,8 @@ export const PTB_COLORS = Object.freeze({
  */
 export const PTB_FOOTERS = Object.freeze({
   STANDARD: "Pacific Trust Bank • No real money is moved.",
-  ADVISORY_RECEIPT: "Receipt analysis only · no balance changes or automatic approvals",
-  AUDIT_LOG: "Pacific Trust Bank • Staff Audit Record",
+  ADVISORY_RECEIPT: "Receipt analysis only",
+  AUDIT_LOG: "",
   BALANCE: "Private ledger balance",
 });
 
@@ -339,7 +339,7 @@ export function buildTicketPanelEmbed(options = {}) {
       },
       ...(Array.isArray(options.extraFields) ? options.extraFields : []),
     ],
-    footer: options.footer || PTB_FOOTERS.STANDARD,
+    footer: options.footer ?? "",
     timestamp: options.timestamp,
   });
 }
@@ -411,7 +411,7 @@ export function buildTicketWelcomeEmbed({
     title: `🎫 ${heading} · ${resolvedCode}`,
     description: "This is a private channel for you, ticket staff, and the PTB bot. Opening a request does **not** change or reserve your balance.",
     fields,
-    footer: footer || PTB_FOOTERS.STANDARD,
+    footer: footer ?? "",
   });
 }
 
@@ -741,7 +741,7 @@ export function buildStaffNotificationEmbed({
     color: resolvedColor,
     title: `🛡️ Staff Notice | ${resolvedTitle}`,
     fields: embedFields,
-    footer: footer || PTB_FOOTERS.AUDIT_LOG,
+    footer: footer ?? "",
   });
 }
 
@@ -815,7 +815,7 @@ export function buildTicketClosureSummaryEmbed({
     title: `Ticket closed · ${code}`,
     description: `Ticket \`${code}\` has been closed and archived.`,
     fields,
-    footer: footer || "Pacific Trust Bank • Ticket Audit Record",
+    footer: footer ?? "",
   });
 }
 
@@ -936,7 +936,7 @@ export function buildCustomEmbed(options, strict = false) {
   return buildPtbEmbed({
     ...options,
     color,
-    footer: options?.footer || PTB_FOOTERS.STANDARD,
+    footer: options?.footer ?? "",
   });
 }
 

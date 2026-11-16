@@ -91,6 +91,11 @@ export const APPLICATION_QUESTIONS = [
 export const DEFAULT_APPLICATION_QUESTIONS = APPLICATION_QUESTIONS;
 
 /**
+ * Default Discord staff channel ID where completed applications are sent for review.
+ */
+export const DEFAULT_APPLICATIONS_REVIEW_CHANNEL_ID = "1571934368619045056";
+
+/**
  * Slash command definition for /application
  */
 export const applicationCommand = new SlashCommandBuilder()
@@ -110,7 +115,11 @@ export const applicationCommand = new SlashCommandBuilder()
           ))
       .addChannelOption((o) =>
         o.setName("channel")
-          .setDescription("Channel to post the application panel and forward submissions for checking")
+          .setDescription("Channel to post the public application panel")
+          .setRequired(false))
+      .addChannelOption((o) =>
+        o.setName("review_channel")
+          .setDescription("Staff channel where submitted applications are sent for checking (defaults to #1571934368619045056)")
           .setRequired(false))
   );
 
@@ -153,16 +162,17 @@ export async function getApplicationReviewChannelId(db) {
 }
 
 /**
- * Resolve the staff review channel ID using DB settings and environment fallbacks.
+ * Resolve the staff review channel ID using DB settings, environment variables, and the default review channel.
  * @param {any} db
  * @returns {Promise<string|null>}
  */
 export async function resolveReviewChannelId(db) {
   const fromDb = await getApplicationReviewChannelId(db);
   return (
-    fromDb ||
     process.env.APPLICATIONS_REVIEW_CHANNEL_ID ||
+    fromDb ||
     process.env.DEFAULT_APPLICATIONS_REVIEW_CHANNEL_ID ||
+    DEFAULT_APPLICATIONS_REVIEW_CHANNEL_ID ||
     process.env.APPLICATIONS_CHANNEL_ID ||
     process.env.MOD_LOG_CHANNEL_ID ||
     process.env.TICKET_LOG_CHANNEL_ID ||
@@ -186,18 +196,31 @@ export async function handleApplicationCommand(db, interaction) {
 
   const action = interaction.options.getString("action");
   const targetChannel = interaction.options.getChannel("channel") || interaction.channel;
+  const reviewChannelOpt = typeof interaction.options.getChannel === "function"
+    ? interaction.options.getChannel("review_channel")
+    : null;
 
   await db.execute({
     sql: "INSERT OR REPLACE INTO application_settings (key, value) VALUES ('status', ?)",
     args: [action],
   });
 
-  if (action === "open" && targetChannel) {
+  if (reviewChannelOpt?.id) {
     await db.execute({
       sql: "INSERT OR REPLACE INTO application_settings (key, value) VALUES ('review_channel_id', ?)",
-      args: [targetChannel.id],
+      args: [reviewChannelOpt.id],
     });
+  } else {
+    const existingReviewId = await getApplicationReviewChannelId(db);
+    if (!existingReviewId || (targetChannel?.id && existingReviewId === targetChannel.id && targetChannel.id !== DEFAULT_APPLICATIONS_REVIEW_CHANNEL_ID)) {
+      await db.execute({
+        sql: "INSERT OR REPLACE INTO application_settings (key, value) VALUES ('review_channel_id', ?)",
+        args: [process.env.APPLICATIONS_REVIEW_CHANNEL_ID || DEFAULT_APPLICATIONS_REVIEW_CHANNEL_ID],
+      });
+    }
+  }
 
+  if (action === "open" && targetChannel) {
     const embed = new EmbedBuilder()
       .setColor(0x0B3D2E)
       .setTitle("Pacific Trust Bank | Bank Staff Applications")
@@ -209,8 +232,7 @@ export async function handleApplicationCommand(db, interaction) {
       .addFields(
         { name: "Positions Available", value: "• Bank Manager: Oversees ledger audits, staff operations, and approvals.\n• Bank Teller: Handles citizen deposits, withdrawals, and customer service." },
         { name: "Requirements", value: "• Active Emergency Hamburg player\n• Professional conduct and reliable availability" }
-      )
-      .setFooter({ text: "Pacific Trust Bank • Official Staff Application" });
+      );
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -230,9 +252,11 @@ export async function handleApplicationCommand(db, interaction) {
     }
   }
 
+  const activeReviewChannelId = await resolveReviewChannelId(db);
   const statusText = action === "open" ? "OPENED" : "CLOSED";
+  const panelLine = action === "open" && targetChannel ? `\nPanel channel: <#${targetChannel.id}>` : "";
   return interaction.reply({
-    content: `# Applications Updated\nStaff applications are now **${statusText}**.\nReview channel: <#${targetChannel.id}>`,
+    content: `# Applications Updated\nStaff applications are now **${statusText}**.${panelLine}\nReview channel: <#${activeReviewChannelId}>`,
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -354,8 +378,7 @@ export async function notifyStaffReview({ db, client, appId, user, roleDesired, 
         { name: "4. Availability", value: String(answers?.availability || "N/A").slice(0, 1024) },
         { name: "5. Scenario Response", value: String(answers?.scenario || "N/A").slice(0, 1024) },
       )
-      .setTimestamp()
-      .setFooter({ text: `Application ID: ${appId} • Pacific Trust Bank Staff Review` });
+      .setTimestamp();
 
     const actionRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -467,8 +490,7 @@ export async function handleApplicationMessageCreate(db, message, client = null)
       { name: "Position Desired", value: session.roleDesired, inline: true },
       { name: "Status", value: "Pending Review", inline: true },
     )
-    .setTimestamp()
-    .setFooter({ text: "Pacific Trust Bank • You will receive a DM once reviewed." });
+    .setTimestamp();
 
   await message.reply({
     content: "**Application Submitted Successfully!**",
@@ -597,8 +619,7 @@ async function finalizeApplicationReview(db, interaction, { action, appId, appli
       let notice;
       const decisionEmbed = new EmbedBuilder()
         .setTitle(`Pacific Trust Bank | Application #${appId}`)
-        .setTimestamp()
-        .setFooter({ text: "Pacific Trust Bank • Staff Applications" });
+        .setTimestamp();
 
       if (action === "accept") {
         notice = `**Congratulations! Your Pacific Trust Bank staff application (#${appId}) has been ACCEPTED.** Welcome to the bank team.`;

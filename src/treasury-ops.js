@@ -312,7 +312,7 @@ function makeReviewEmbed(row) {
       { name: "Screenshot analysis (assessment only)", value: `Payment screen: ${identifyPaymentScreen(row.ocr_text) ? "detected" : "not confidently identified"}\nSender / payer: ${row.extracted_payer ?? "not confirmed from explicit sender text"}\nRecipient (shown after “to”): ${row.extracted_recipient ?? "not confirmed"}\nSent amount (including € value): ${row.extracted_amount ?? "not readable"}\nAmount comparison: ${describeAmountComparison(row.amount_comparison)}\nTransaction ID: ${row.transaction_id ?? "not found"}` },
       { name: "Automated findings", value: findings.length ? findings.join(", ") : "No discrepancies detected; image analysis does not prove transfer authenticity." },
       ...(row.duplicate_of ? [{ name: "Duplicate match", value: `Related receipt: ${row.duplicate_of}` }] : []),
-    ).setImage(row.attachment_url).setFooter({ text: "Screenshot-assisted review; authorized human approval is required." });
+    ).setImage(row.attachment_url);
 }
 
 export async function submitTreasuryPayment(db, interaction, { reviewChannelId, reviewerRoleIds = "" }) {

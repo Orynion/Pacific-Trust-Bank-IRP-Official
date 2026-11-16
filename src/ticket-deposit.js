@@ -472,7 +472,7 @@ function buildFallbackEmbed(raw, context) {
       { name: "Time", value: unixTimestamp ? `<t:${unixTimestamp}:f>` : "Not detected", inline: true },
       { name: "Confidence", value: confidenceDisplay, inline: true },
     )
-    .setFooter({ text: "Receipt analysis only · no balance changes or automatic approvals" });
+    .setFooter({ text: "Receipt analysis only" });
 }
 
 async function renderAnalysisPayload(raw, context) {
@@ -497,8 +497,7 @@ function buildErrorEmbed(context, error = null) {
   return new EmbedBuilder()
     .setColor(0xD97706)
     .setTitle(`Receipt check unavailable · ${ticketCode(context.ticket)}`)
-    .setDescription(`I could not analyze **${imageLabel}**. The ticket is unchanged and still needs human review. You can upload a clearer screenshot or ask ticket staff to inspect this one manually.${detailLine}`)
-    .setFooter({ text: "No balance changes or automatic approvals were made." });
+    .setDescription(`I could not analyze **${imageLabel}**. The ticket is unchanged and still needs human review. You can upload a clearer screenshot or ask ticket staff to inspect this one manually.${detailLine}`);
 }
 
 /**

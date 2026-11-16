@@ -9,11 +9,14 @@ import {
   activeApplicationSessions,
   APPLICATION_QUESTIONS,
   applicationSchemaStatements,
+  DEFAULT_APPLICATIONS_REVIEW_CHANNEL_ID,
   ensureApplicationRejectionReasonColumn,
   handleApplicationApplyButton,
+  handleApplicationCommand,
   handleApplicationRejectModal,
   handleApplicationReviewButton,
   handleDirectMessage,
+  resolveReviewChannelId,
   SESSION_TIMEOUT_MS,
 } from "./applications.js";
 
@@ -478,6 +481,45 @@ test("OWNER_ROLE_ID reviewer can accept via app:review:accept and assign REPRESE
     else process.env.OWNER_ROLE_ID = prevOwner;
     if (prevRep === undefined) delete process.env.REPRESENTATIVE_ROLE_ID;
     else process.env.REPRESENTATIVE_ROLE_ID = prevRep;
+    await db.close();
+  }
+});
+
+test("review channel defaults to 1571934368619045056 and is not overwritten by public panel channel", async () => {
+  const db = await openDb();
+  const prevEnv = process.env.APPLICATIONS_REVIEW_CHANNEL_ID;
+  delete process.env.APPLICATIONS_REVIEW_CHANNEL_ID;
+
+  try {
+    assert.equal(DEFAULT_APPLICATIONS_REVIEW_CHANNEL_ID, "1571934368619045056");
+    assert.equal(await resolveReviewChannelId(db), "1571934368619045056");
+
+    const panelMessages = [];
+    let commandReply = null;
+    await handleApplicationCommand(db, {
+      memberPermissions: { has: (flag) => flag === PermissionFlagsBits.Administrator },
+      channel: {
+        id: "public-apply-chan",
+        async send(payload) {
+          panelMessages.push(payload);
+        },
+      },
+      options: {
+        getString: (name) => (name === "action" ? "open" : null),
+        getChannel: () => null,
+      },
+      async reply(payload) {
+        commandReply = payload;
+      },
+    });
+
+    assert.equal(panelMessages.length, 1);
+    assert.equal(await resolveReviewChannelId(db), "1571934368619045056");
+    assert.match(commandReply.content, /<#public-apply-chan>/);
+    assert.match(commandReply.content, /<#1571934368619045056>/);
+  } finally {
+    if (prevEnv === undefined) delete process.env.APPLICATIONS_REVIEW_CHANNEL_ID;
+    else process.env.APPLICATIONS_REVIEW_CHANNEL_ID = prevEnv;
     await db.close();
   }
 });
