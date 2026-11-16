@@ -36,9 +36,11 @@ import { ensureAmountComparisonColumn, handleTreasuryButton, handleTreasuryModal
 import {
   applicationSchemaStatements,
   applicationCommand,
+  ensureApplicationRejectionReasonColumn,
   handleApplicationCommand,
   handleApplicationApplyButton,
   handleApplicationMessageCreate,
+  handleApplicationRejectModal,
   handleApplicationReviewButton,
 } from "./applications.js";
 import {
@@ -623,6 +625,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     return;
   }
+  if (interaction.isModalSubmit() && interaction.customId.startsWith("app:reject-modal:")) {
+    try {
+      await handleApplicationRejectModal(db, interaction);
+    } catch (error) {
+      console.error("PTB application rejection modal failed:", error);
+      await respond(interaction, { content: "I could not process that application rejection.", ...ephemeralReply })
+        .catch((replyError) => console.error("Could not send application rejection modal error reply:", replyError));
+    }
+    return;
+  }
   if (interaction.isModalSubmit() && interaction.customId.startsWith("server-embed-dynamic-modal:")) {
     try {
       await handleServerEmbedDynamicModalSubmit(interaction);
@@ -845,6 +857,7 @@ async function initializeDatabase() {
     await ensureAmountComparisonColumn(db);
     await ensureFrozenUntilColumn(db);
     await ensureTicketKindMigration(db);
+    await ensureApplicationRejectionReasonColumn(db);
     console.log("PTB ledger database initialized successfully.");
     return true;
   } catch (error) {

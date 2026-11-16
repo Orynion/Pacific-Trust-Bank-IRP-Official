@@ -4,8 +4,11 @@ import {
   ButtonStyle,
   EmbedBuilder,
   MessageFlags,
+  ModalBuilder,
   PermissionFlagsBits,
   SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from "discord.js";
 
 /**
@@ -24,11 +27,30 @@ export const applicationSchemaStatements = [
     status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
     reviewed_by TEXT,
     reviewed_at TEXT,
+    rejection_reason TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE INDEX IF NOT EXISTS idx_applications_user_status
     ON applications (user_id, status)`,
 ];
+
+/**
+ * Idempotent startup migration adding rejection_reason to existing applications tables.
+ * @param {any} db
+ * @returns {Promise<boolean>}
+ */
+export async function ensureApplicationRejectionReasonColumn(db) {
+  try {
+    await db.execute("ALTER TABLE applications ADD COLUMN rejection_reason TEXT");
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    if (!/duplicate column|already exists/i.test(message)) {
+      console.error("[PTB Applications] Failed to add rejection_reason column:", message);
+      return false;
+    }
+  }
+  return true;
+}
 
 /**
  * In-memory active application questionnaire sessions: userId -> sessionObject
@@ -374,45 +396,67 @@ export async function handleApplicationMessageCreate(db, message) {
   return true;
 }
 
-/**
- * Handles staff review button clicks (app:accept:<appId>:<userId> or app:reject:<appId>:<userId>).
- * @param {any} db
- * @param {import("discord.js").ButtonInteraction} interaction
- * @returns {Promise<void>}
- */
-export async function handleApplicationReviewButton(db, interaction) {
-  if (!interaction.customId?.startsWith("app:")) return;
-
-  const parts = interaction.customId.split(":");
-  const action = parts[1]; // accept or reject
-  const appId = parts[2];
-  const applicantId = parts[3];
-
-  if (!["accept", "reject"].includes(action)) return;
-
-  const hasAdmin = Boolean(
+function isApplicationReviewer(interaction) {
+  return Boolean(
     interaction.member?.permissions?.has(PermissionFlagsBits.Administrator) ||
     interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
   );
+}
 
-  if (!hasAdmin) {
-    return interaction.reply({
-      content: "Only administrators can accept or reject staff applications.",
-      flags: MessageFlags.Ephemeral,
-    });
+/**
+ * Finalizes an application review decision (accept or reject) and notifies the applicant.
+ * @param {any} db
+ * @param {import("discord.js").ButtonInteraction | import("discord.js").ModalSubmitInteraction} interaction
+ * @param {{ action: "accept" | "reject", appId: string, applicantId: string, reason?: string }} params
+ * @returns {Promise<void>}
+ */
+async function finalizeApplicationReview(db, interaction, { action, appId, applicantId, reason = "" }) {
+  const cleanReason = String(reason ?? "").trim().slice(0, 500);
+  const newStatus = action === "accept" ? "accepted" : "rejected";
+  const storedReason = action === "reject" && cleanReason ? cleanReason : null;
+
+  const isModal = typeof interaction.isModalSubmit === "function" && interaction.isModalSubmit();
+  const hasMessage = Boolean(interaction.message);
+
+  if (!isModal || hasMessage) {
+    if (typeof interaction.deferUpdate === "function" && !interaction.deferred && !interaction.replied) {
+      await interaction.deferUpdate().catch(() => {});
+    }
+  } else if (typeof interaction.deferReply === "function" && !interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
   }
 
-  await interaction.deferUpdate().catch(() => {});
-
-  const newStatus = action === "accept" ? "accepted" : "rejected";
-
+  let updatedRows = 1;
   try {
-    await db.execute({
-      sql: "UPDATE applications SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
-      args: [newStatus, interaction.user.id, appId],
+    const updateRes = await db.execute({
+      sql: "UPDATE applications SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP, rejection_reason = ? WHERE id = ? AND status = 'pending'",
+      args: [newStatus, interaction.user.id, storedReason, appId],
     });
+    if (updateRes && updateRes.rowsAffected !== undefined) {
+      updatedRows = Number(updateRes.rowsAffected);
+    }
   } catch (err) {
     console.error("[PTB Applications] Failed to update application status in DB:", err);
+  }
+
+  if (updatedRows === 0) {
+    const existing = await db.execute({
+      sql: "SELECT status, reviewed_by FROM applications WHERE id = ? LIMIT 1",
+      args: [appId],
+    }).catch(() => null);
+    const current = existing?.rows?.[0];
+    const alreadyMsg = current
+      ? `Application #${appId} has already been **${String(current.status).toUpperCase()}**${current.reviewed_by ? ` by <@${current.reviewed_by}>` : ""}.`
+      : `Application #${appId} was not found or is no longer pending.`;
+
+    if (interaction.deferred && typeof interaction.followUp === "function" && (!isModal || hasMessage)) {
+      await interaction.followUp({ content: alreadyMsg, flags: MessageFlags.Ephemeral }).catch(() => {});
+    } else if (interaction.deferred && typeof interaction.editReply === "function") {
+      await interaction.editReply({ content: alreadyMsg }).catch(() => {});
+    } else if (typeof interaction.reply === "function") {
+      await interaction.reply({ content: alreadyMsg, flags: MessageFlags.Ephemeral }).catch(() => {});
+    }
+    return;
   }
 
   if (action === "accept" && interaction.guild) {
@@ -433,14 +477,19 @@ export async function handleApplicationReviewButton(db, interaction) {
     const applicantUser = await interaction.client.users.fetch(applicantId).catch(() => null);
     if (applicantUser) {
       const dm = await applicantUser.createDM();
-      const notice = action === "accept"
-        ? `**Congratulations! Your Pacific Trust Bank staff application (#${appId}) has been ACCEPTED.** Welcome to the bank team.`
-        : `**Update on your Pacific Trust Bank staff application (#${appId})**: Thank you for applying. Unfortunately, your application was not accepted at this time.`;
+      let notice;
+      if (action === "accept") {
+        notice = `**Congratulations! Your Pacific Trust Bank staff application (#${appId}) has been ACCEPTED.** Welcome to the bank team.`;
+      } else if (cleanReason) {
+        notice = `**Update on your Pacific Trust Bank staff application (#${appId})**: Thank you for applying. Unfortunately, your application was not accepted at this time.\n**Reason:** ${cleanReason}`;
+      } else {
+        notice = `**Update on your Pacific Trust Bank staff application (#${appId})**: Thank you for applying. Unfortunately, your application was not accepted at this time.`;
+      }
       await dm.send({ content: notice }).catch(() => {});
     }
   } catch {}
 
-  const oldEmbed = interaction.message.embeds[0];
+  const oldEmbed = interaction.message?.embeds?.[0];
   if (oldEmbed) {
     const updatedEmbed = EmbedBuilder.from(oldEmbed)
       .setColor(action === "accept" ? 0x10B981 : 0xEF4444)
@@ -448,7 +497,111 @@ export async function handleApplicationReviewButton(db, interaction) {
         name: "Review Status",
         value: `**${action === "accept" ? "ACCEPTED" : "REJECTED"}** by <@${interaction.user.id}>`,
       });
+    if (action === "reject" && cleanReason) {
+      updatedEmbed.addFields({
+        name: "Rejection Reason",
+        value: cleanReason,
+      });
+    }
 
     await interaction.message.edit({ embeds: [updatedEmbed], components: [] }).catch(() => {});
+  } else if (isModal) {
+    const confirmation = `Application #${appId} has been **REJECTED**${cleanReason ? `.\n**Reason:** ${cleanReason}` : "."}`;
+    if (interaction.deferred && typeof interaction.editReply === "function") {
+      await interaction.editReply({ content: confirmation }).catch(() => {});
+    } else if (typeof interaction.reply === "function") {
+      await interaction.reply({ content: confirmation, flags: MessageFlags.Ephemeral }).catch(() => {});
+    }
   }
+}
+
+/**
+ * Handles staff review button clicks (app:accept:<appId>:<userId> or app:reject:<appId>:<userId>).
+ * @param {any} db
+ * @param {import("discord.js").ButtonInteraction} interaction
+ * @returns {Promise<void>}
+ */
+export async function handleApplicationReviewButton(db, interaction) {
+  if (!interaction.customId?.startsWith("app:")) return;
+
+  const parts = interaction.customId.split(":");
+  const action = parts[1]; // accept or reject
+  const appId = parts[2];
+  const applicantId = parts[3];
+
+  if (!["accept", "reject"].includes(action)) return;
+
+  if (!isApplicationReviewer(interaction)) {
+    return interaction.reply({
+      content: "Only administrators can accept or reject staff applications.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  if (action === "reject" && typeof interaction.showModal === "function") {
+    const existing = await db.execute({
+      sql: "SELECT status, reviewed_by FROM applications WHERE id = ? LIMIT 1",
+      args: [appId],
+    }).catch(() => null);
+    const current = existing?.rows?.[0];
+    if (current && current.status !== "pending") {
+      return interaction.reply({
+        content: `Application #${appId} has already been **${String(current.status).toUpperCase()}**${current.reviewed_by ? ` by <@${current.reviewed_by}>` : ""}.`,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    const modal = new ModalBuilder()
+      .setCustomId(`app:reject-modal:${appId}:${applicantId}`)
+      .setTitle(`Reject Application #${appId}`.slice(0, 45));
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("reason")
+          .setLabel("Rejection reason (optional)")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(false)
+          .setMaxLength(500)
+          .setPlaceholder("Optional: share feedback or why the application was rejected"),
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
+  return finalizeApplicationReview(db, interaction, { action, appId, applicantId });
+}
+
+/**
+ * Handles modal submission for rejecting a staff application with an optional reason.
+ * @param {any} db
+ * @param {import("discord.js").ModalSubmitInteraction} interaction
+ * @returns {Promise<void>}
+ */
+export async function handleApplicationRejectModal(db, interaction) {
+  if (!interaction.customId?.startsWith("app:reject-modal:")) return;
+
+  if (!isApplicationReviewer(interaction)) {
+    return interaction.reply({
+      content: "Only administrators can accept or reject staff applications.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const parts = interaction.customId.split(":");
+  const appId = parts[2];
+  const applicantId = parts[3];
+
+  let reason = "";
+  try {
+    reason = String(interaction.fields?.getTextInputValue("reason") ?? "").trim().slice(0, 500);
+  } catch {
+    reason = "";
+  }
+
+  return finalizeApplicationReview(db, interaction, {
+    action: "reject",
+    appId,
+    applicantId,
+    reason,
+  });
 }
