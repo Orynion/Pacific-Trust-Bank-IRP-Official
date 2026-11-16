@@ -654,7 +654,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
   if (interaction.isButton()) {
-    if (interaction.customId === "app:apply_rep") {
+    if (interaction.customId.startsWith("app:apply:")) {
       try {
         await handleApplicationApplyButton(db, interaction);
       } catch (error) {
